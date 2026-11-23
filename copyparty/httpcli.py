@@ -4730,11 +4730,13 @@ class HttpCli(object):
             raise Pebkac(400, "you must be authenticated to use ?tail on this server")
         return True
 
-    def _can_zip(self, volflags: dict[str, Any]) -> str:
+    def _can_zip(self, volflags: dict[str, Any], can_admin: Optional[bool] = None) -> str:
+        if can_admin is None:
+            can_admin = self.can_admin
         lvl = volflags["zip_who"]
         if self.args.no_zip or not lvl:
             return "download-as-zip/tar is disabled in server config"
-        elif lvl <= 1 and not self.can_admin:
+        elif lvl <= 1 and not can_admin:
             return "download-as-zip/tar is admin-only on this server"
         elif lvl <= 2 and self.uname in ("", "*"):
             return "you must be authenticated to download-as-zip/tar on this server"
@@ -5437,6 +5439,63 @@ class HttpCli(object):
 
         return not broken
 
+    def _check_zip_limits(
+        self, vn: VFS, rem: str, items: set[str], dots: int, scandir: bool
+    ) -> None:
+        nodes = [vn]
+        share_root = vn if vn.shr_dir else None
+        if self.args.shr_path and not (vn.vpath or rem):
+            share_root = vn.nodes.get(self.args.shr1.rstrip("/"))
+        pending = [share_root] if share_root and share_root.shr_dir else []
+        while pending:
+            for child in pending.pop().nodes.values():
+                if child.shr_dir:
+                    pending.append(child)
+                elif child.shr_key.startswith("/"):
+                    nodes.append(child)
+
+        policies = {}
+        for node in nodes:
+            vf = node.flags
+            denied = ""
+            if node is not vn:
+                denied = self._can_zip(vf, self.uname in node.axs.uadmin)
+            maxs = maxn = 0
+            if vf.get("zipmax") and not (vf.get("zipmaxu") and self.uname != "*"):
+                maxs = vf.get("zipmaxs_v") or 0
+                maxn = vf.get("zipmaxn_v") or 0
+            if denied or maxs or maxn:
+                msg = (
+                    vf.get("zipmaxt")
+                    or "total size exceeds a limit specified in server config"
+                )
+                policies[node] = (denied, maxs, maxn, msg)
+
+        if not policies:
+            return
+
+        counts: dict[VFS, tuple[int, int]] = {}
+        check_shares = any(node is not vn for node in policies)
+        for entry in vn.zipgen("", rem, items, self.uname, False, dots, scandir):
+            targets = (vn,)
+            if check_shares:
+                share, _ = vn._find(vjoin(rem, entry["vp"]))
+                if share is not vn:
+                    targets = (vn, share)
+            for node in targets:
+                policy = policies.get(node)
+                if not policy:
+                    continue
+                denied, maxs, maxn, msg = policy
+                if denied:
+                    raise Pebkac(400, denied)
+                nf, nb = counts.get(node, (0, 0))
+                nf += 1
+                nb += entry["st"].st_size
+                if (maxs and nb > maxs) or (maxn and nf > maxn):
+                    raise Pebkac(400, msg)
+                counts[node] = (nf, nb)
+
     def tx_zip(
         self,
         fmt: str,
@@ -5491,32 +5550,8 @@ class HttpCli(object):
             # single folder; the folder itself is the top-level item
             vpath = vpath.split("/")[-1].lstrip(".") or "top"
 
-        if vn.flags.get("zipmax") and not (
-            vn.flags.get("zipmaxu") and self.uname != "*"
-        ):
-            maxs = vn.flags.get("zipmaxs_v") or 0
-            maxn = vn.flags.get("zipmaxn_v") or 0
-            nf = 0
-            nb = 0
-            fgen = vn.zipgen(vpath, rem, set(items), self.uname, False, dots, scandir)
-            t = "total size exceeds a limit specified in server config"
-            t = vn.flags.get("zipmaxt") or t
-            if maxs and maxn:
-                for zd in fgen:
-                    nf += 1
-                    nb += zd["st"].st_size
-                    if maxs < nb or maxn < nf:
-                        raise Pebkac(400, t)
-            elif maxs:
-                for zd in fgen:
-                    nb += zd["st"].st_size
-                    if maxs < nb:
-                        raise Pebkac(400, t)
-            elif maxn:
-                for zd in fgen:
-                    nf += 1
-                    if maxn < nf:
-                        raise Pebkac(400, t)
+        selected = set(items)
+        self._check_zip_limits(vn, rem, selected, dots, scandir)
 
         cdis = gen_content_disposition("%s.%s" % (fn, ext))
         self.log(repr(cdis))
@@ -5524,7 +5559,7 @@ class HttpCli(object):
             "oh_f", None, mime=mime, headers={"Content-Disposition": cdis}
         )
 
-        fgen = vn.zipgen(vpath, rem, set(items), self.uname, False, dots, scandir)
+        fgen = vn.zipgen(vpath, rem, selected, self.uname, False, dots, scandir)
         # for f in fgen: print(repr({k: f[k] for k in ["vp", "ap"]}))
         cfmt = ""
         if self.thumbcli and not self.args.no_bacode:
@@ -6984,6 +7019,10 @@ class HttpCli(object):
             raise Pebkac(403, "the copy feature is disabled in server config")
 
         svn, srem = self.asrv.vfs.get(vsrc, self.uname, True, False)
+        if svn.shr_dir:
+            raise Pebkac(400, "cannot copy a virtual share directory")
+        if svn.shr_file and "\0" in svn.canonical(srem):
+            raise Pebkac(404, "copy source not found")
         dvn, drem = self.asrv.vfs.get(vdst, self.uname, False, True)
 
         if overwrite:

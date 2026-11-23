@@ -2096,7 +2096,7 @@ class AuthSrv(object):
         shares = {}
         if enshare:
             assert sqlite3  # type: ignore  # !rm
-            if shr in vfs.all_nodes:
+            if shr in vfs.all_nodes or (self.args.wopi and shr == "wopi"):
                 t = "invalid config: a volume is overlapping with the --shr global-option (/%s)"
                 self.log(t % (shr,), 1)
                 raise Exception(t % (shr,))

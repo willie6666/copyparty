@@ -72,6 +72,10 @@ git_fork() {
         -c 'credential.helper=!gh auth git-credential' "$@"
 }
 
+sha256() {
+    python3 -I -S -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$1"
+}
+
 merge_into_fork() {
     if git -C "$source_dir" merge --no-edit "$1"; then
         return
@@ -84,9 +88,8 @@ merge_into_fork() {
 }
 
 if [ -n "$resume" ]; then
-    work_dir=$(cd "$resume" && pwd -P)
-    [ -f "$work_dir/upstream-tag" ] && [ -d "$work_dir/source/.git" ] \
-        || die "Updater workspace not found at $work_dir"
+    work_dir=$(cd "$resume" && pwd -P) || die "Updater workspace not found at $resume"
+    [ -f "$work_dir/upstream-tag" ] || die "Updater workspace not found at $work_dir"
     upstream_tag=$(cat "$work_dir/upstream-tag")
 else
     upstream_tag=$(gh release view --repo "github.com/$upstream" --json tagName --jq .tagName)
@@ -115,6 +118,32 @@ fork_tag="${upstream_tag}-shr-path.1"
 release_url="https://github.com/$fork/releases/tag/$fork_tag"
 fork_url="https://github.com/$fork.git"
 source_dir="$work_dir/source"
+
+verify_published_sfx() {
+    local artifact=$1 digest actual_digest ref refs commit version suffix
+    digest=$(gh release view "$fork_tag" --repo "github.com/$fork" --json body --jq .body |
+        sed -nE 's/^The SHA-256 of `copyparty-sfx\.py` is `([0-9a-fA-F]{64})`\.$/\1/p' |
+        tr '[:upper:]' '[:lower:]')
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "Missing or ambiguous SFX checksum for $fork_tag"
+    actual_digest=$(sha256 "$artifact")
+    [ "$actual_digest" = "$digest" ] || die "Published SFX checksum mismatch for $fork_tag"
+
+    ref="refs/tags/$fork_tag"
+    refs=$(git_fork ls-remote --exit-code "$fork_url" "$ref" "$ref^{}") \
+        || die "Could not resolve the published tag $fork_tag"
+    commit=$(awk -v ref="$ref" '
+        $2 == ref { tag = $1 }
+        $2 == ref "^{}" { peeled = $1 }
+        END { print peeled ? peeled : tag }
+    ' <<< "$refs")
+    version=$(python3 -I -S "$artifact" --versionb) || die "Could not read the published SFX version"
+    suffix=${version#"${upstream_tag#v}"}
+    if [[ "$version" == "${upstream_tag#v}-"* && "$suffix" =~ ^-[0-9]+-g([0-9a-f]{4,40})$ ]] &&
+        [[ "$commit" == "${BASH_REMATCH[1]}"* ]]; then
+        return
+    fi
+    die "Published SFX version $version does not match $fork_tag ($commit)"
+}
 
 deploy_sfx() {
     local artifact=$1 target backup
@@ -153,7 +182,9 @@ if [ -z "$build_output" ]; then
             if [ -n "$deploy_file" ]; then
                 download_dir=$(mktemp -d "$work_dir/download.XXXXXXXX")
                 gh release download "$fork_tag" --repo "github.com/$fork" --pattern "$asset_name" --dir "$download_dir"
-                deploy_sfx "$download_dir/$asset_name"
+                artifact="$download_dir/$asset_name"
+                verify_published_sfx "$artifact"
+                deploy_sfx "$artifact"
             fi
             exit 0
             ;;
@@ -173,7 +204,7 @@ if [ "$(uname -s)" = Darwin ]; then
     done
 fi
 
-if [ -z "$resume" ]; then
+if [ ! -d "$source_dir/.git" ]; then
     git_fork clone --no-tags --single-branch --branch "$branch" "$fork_url" "$source_dir"
 else
     [ "$(git -C "$source_dir" config --get remote.origin.url)" = "$fork_url" ] \
@@ -309,16 +340,12 @@ if [ -z "$remote_tag" ]; then
 fi
 
 notes="$build_dir/notes.md"
-python3 - "$artifact" "$upstream_tag" > "$notes" <<'PY'
-import hashlib
-from pathlib import Path
-import sys
-
-digest = hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest()
-print(f"Updates this fork to {sys.argv[2]} with browsable public share paths.\n")
-print("Download `copyparty-sfx.py` and run it with your existing configuration.")
-print(f"\nThe SHA-256 of `copyparty-sfx.py` is `{digest}`.")
-PY
+digest=$(sha256 "$artifact")
+{
+    printf 'Updates this fork to %s with browsable public share paths.\n\n' "$upstream_tag"
+    printf 'Download `copyparty-sfx.py` and run it with your existing configuration.\n\n'
+    printf 'The SHA-256 of `copyparty-sfx.py` is `%s`.\n' "$digest"
+} > "$notes"
 case "$release_state" in
     draft|draft-ready)
         if [ "$release_state" = draft ]; then

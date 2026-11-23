@@ -340,6 +340,94 @@ class TestShr(unittest.TestCase):
         self.assertFalse(self.ls("shr/libraries/pair", False)[0])
         self.assertTrue(self.curl("shr/secret/f1?pw=p2")[0].startswith("HTTP/1.1 200 "))
 
+    def test_public_share_copy_preserves_destination(self):
+        self.args = Cfg(
+            a=["u1:p1"],
+            v=["d1:private:A,u1", "d2:dest:A,u1"],
+            shr="/shr/",
+            shr1="shr/",
+            shr_db="a.db",
+            shr_path=True,
+            shr_v=False,
+        )
+        self.cinit()
+        self.addCleanup(self.conn.shutdown)
+        jt = {
+            "path": "library/manual.txt",
+            "vp": ["/private/f1"],
+            "exp": "0",
+            "perms": ["read"],
+        }
+        h, _ = self.post_json("?pw=p1&share", jt)
+        self.assertTrue(h.startswith("HTTP/1.1 201 "), h)
+        self.asrv.reload()
+
+        with open("d2/keep.txt", "wb") as f:
+            f.write(b"keep")
+        req = (
+            b"COPY /shr/library/%s?pw=p1 HTTP/1.1\r\n"
+            b"Destination: /dest/keep.txt\r\nConnection: close\r\n\r\n"
+        )
+        HttpCli(self.conn.setbuf(req % b"")).run()
+        self.assertTrue(self.conn.s._reply.startswith(b"HTTP/1.1 400 "))
+        os.unlink("d1/f1")
+        HttpCli(self.conn.setbuf(req % b"manual.txt")).run()
+        self.assertTrue(self.conn.s._reply.startswith(b"HTTP/1.1 404 "))
+        with open("d2/keep.txt", "rb") as f:
+            self.assertEqual(f.read(), b"keep")
+
+    def test_public_archives_enforce_share_policy(self):
+        self.args = Cfg(
+            a=["u1:p1"],
+            v=[
+                "d1:limited:A,u1:c,zipmaxn=1",
+                "d2:restricted:A,u1:c,zip_who=2",
+            ],
+            shr="/shr/",
+            shr1="shr/",
+            shr_db="a.db",
+            shr_path=True,
+            shr_v=False,
+        )
+        self.cinit()
+        self.addCleanup(self.conn.shutdown)
+        with open("d1/second", "wb") as f:
+            f.write(b"second")
+        for path, vps in (
+            ("parent/limited/files", ["/limited/f1", "/limited/second"]),
+            ("parent/restricted/file", ["/restricted/f2"]),
+        ):
+            jt = {"path": path, "vp": vps, "exp": "0", "perms": ["read"]}
+            h, _ = self.post_json("?pw=p1&share", jt)
+            self.assertTrue(h.startswith("HTTP/1.1 201 "), h)
+        self.asrv.reload()
+
+        h, body = self.curl("shr/parent/limited/?zip=crc", True)
+        self.assertTrue(h.startswith("HTTP/1.1 400 "), h)
+        self.assertIn(b"total size exceeds a limit", body)
+        url = "shr/parent/restricted/?tar"
+        h, body = self.curl(url, True)
+        self.assertTrue(h.startswith("HTTP/1.1 400 "), h)
+        self.assertIn(b"you must be authenticated", body)
+        h, _ = self.curl(url + "&pw=p1", True)
+        self.assertTrue(h.startswith("HTTP/1.1 200 "), h)
+
+    def test_share_root_cannot_overlap_wopi(self):
+        for public_paths in (False, True):
+            self.args = Cfg(
+                a=["u1:p1"],
+                v=["d1:private:A,u1"],
+                shr="/wopi/",
+                shr1="wopi/",
+                shr_db="a.db",
+                shr_path=public_paths,
+                wopi=True,
+                wopi_accs="",
+            )
+            with self.assertRaises(Exception) as ex:
+                AuthSrv(self.args, self.log)
+            self.assertIn("overlapping with the --shr global-option (/wopi)", str(ex.exception))
+
     def ls(self, url: str, auth: bool):
         zs = url + "?ls" + ("&pw=p1" if auth else "")
         h, b = self.curl(zs)
