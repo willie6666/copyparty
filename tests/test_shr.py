@@ -79,6 +79,7 @@ class TestShr(unittest.TestCase):
         with db:
             zs = r"create table sh (k text, pw text, vp text, pr text, st int, un text, t0 int, t1 int)"
             db.execute(zs)
+            db.execute("create table sf (k text, vp text)")
         db.close()
 
     def tearDown(self):
@@ -242,6 +243,102 @@ class TestShr(unittest.TestCase):
         self.put("shr/d4/ld/a", 401)
 
         self.conn.shutdown()
+
+    def test_public_paths(self):
+        self.args = Cfg(
+            a=["u1:p1", "u2:p4"],
+            v=["::A,u1:r,u2"],
+            shr="/shr/",
+            shr1="shr/",
+            shr_db="a.db",
+            shr_path=True,
+            shr_site="https://share.example.com/",
+            shr_adm="",
+            shr_rt=1440,
+            shr_v=False,
+            xvol=True,
+        )
+        self.args.shr_who = "a"
+        self.cinit()
+        self.addCleanup(self.conn.shutdown)
+        self.assertEqual(self.ls("shr", False), (True, [], []))
+        with open("d1/f1b", "wb") as f:
+            f.write(b"second file")
+
+        file_req = {"vp": ["/d1/f1"], "exp": "0", "perms": ["read"]}
+        auth = "?pw=p1&share"
+        h, body = self.post_json(auth, dict(file_req, path="python/aaa.py"))
+        self.assertTrue(h.startswith("HTTP/1.1 201 "), body)
+        self.assertIn("created share: https://share.example.com/shr/python/aaa.py", body)
+        h, body = self.post_json(auth, dict(file_req, path="python/also here +.py"))
+        self.assertTrue(h.startswith("HTTP/1.1 201 "), body)
+        self.assertIn("/shr/python/also%20here%20%2B.py", body)
+        h, body = self.post_json(auth, dict(file_req, k="secret", pw="p2"))
+        self.assertTrue(h.startswith("HTTP/1.1 201 "), body)
+        self.assertIn("/shr/secret/f1", body)
+        h, body = self.post_json(auth, dict(file_req, k="unlisted"))
+        self.assertTrue(h.startswith("HTTP/1.1 201 "), body)
+        h, body = self.post_json(auth, dict(file_req, path="libraries/one", vp=["/d1/"]))
+        self.assertTrue(h.startswith("HTTP/1.1 201 "), body)
+        h, body = self.post_json(
+            auth, dict(file_req, path="libraries/pair", vp=["/d1/f1", "/d1/f1b"])
+        )
+        self.assertTrue(h.startswith("HTTP/1.1 201 "), body)
+
+        for path in (
+            "python", "python/aaa.py", "python/aaa.py/x", "secret/x",
+            "a/../b", "a//b", "/a", "a/", "",
+        ):
+            h, body = self.post_json(auth, dict(file_req, path=path))
+            self.assertTrue(h.startswith("HTTP/1.1 400 "), body)
+        h, body = self.post_json(auth, dict(file_req, k="python"))
+        self.assertTrue(h.startswith("HTTP/1.1 400 "), body)
+        h, body = self.post_json(auth, dict(file_req, path="private", pw="p3"))
+        self.assertTrue(h.startswith("HTTP/1.1 400 "), body)
+        h, body = self.post_json("?share", dict(file_req, path="unauthorized"))
+        self.assertTrue(h.startswith("HTTP/1.1 400 "), body)
+        h, body = self.post_json("?pw=p4&share", dict(file_req, path="non-admin"))
+        self.assertTrue(h.startswith("HTTP/1.1 400 "), body)
+
+        self.asrv.reload()
+        self.assertEqual(self.ls("shr", False), (True, ["libraries", "python"], []))
+        self.assertEqual(
+            self.ls("shr/python", False), (True, [], ["aaa.py", "also%20here%20%2B.py"])
+        )
+        self.assertEqual(self.ls("shr/libraries/pair", False), (True, [], ["f1", "f1b"]))
+        self.assertIn("f1", self.ls("shr/libraries/one", False)[2])
+        _, body = self.curl("shr?pw=p2&ls")
+        self.assertEqual(
+            [x["href"] for x in json.loads(body)["dirs"]], ["libraries/", "python/"]
+        )
+        for path in (
+            "python/aaa.py", "python/also%20here%20%2B.py", "secret/f1?pw=p2", "unlisted/f1",
+        ):
+            h, body = self.curl("shr/" + path, True)
+            self.assertTrue(h.startswith("HTTP/1.1 200 "), h)
+            self.assertEqual(body, b">>fb:d1/f1")
+        for path in ("shr/python/f1", "shr/python/aaa.py/f1", "shr/secret/f1", "d1/f1"):
+            h, _ = self.curl(path)
+            self.assertFalse(h.startswith("HTTP/1.1 200 "), h)
+
+        with sqlite3.connect("a.db") as db:
+            db.execute("update sh set t1 = 2 where k = ?", ("/python/aaa.py",))
+        self.asrv.reload()
+        self.assertEqual(self.ls("shr/python", False), (True, [], ["also%20here%20%2B.py"]))
+
+        req = (
+            b"POST /?pw=p1&eshare=rm&skey=%2Fpython%2Falso%20here%20%2B.py HTTP/1.1\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        HttpCli(self.conn.setbuf(req)).run()
+        self.assertTrue(self.conn.s._reply.startswith(b"HTTP/1.1 200 "))
+        self.asrv.reload()
+        self.assertEqual(self.ls("shr", False), (True, ["libraries"], []))
+
+        self.args.shr_path = False
+        self.asrv.reload()
+        self.assertFalse(self.ls("shr/libraries/pair", False)[0])
+        self.assertTrue(self.curl("shr/secret/f1?pw=p2")[0].startswith("HTTP/1.1 200 "))
 
     def ls(self, url: str, auth: bool):
         zs = url + "?ls" + ("&pw=p1" if auth else "")

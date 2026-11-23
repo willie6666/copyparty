@@ -314,9 +314,10 @@ class Up2k(object):
             return
 
         Daemon(self._snapshot, "up2k-snapshot")
+        if self.have_e2d or (self.args.shr and self.args.shr_path):
+            Daemon(self._sched_rescan, "up2k-rescan")
         if self.have_e2d:
             Daemon(self._hasher, "up2k-hasher")
-            Daemon(self._sched_rescan, "up2k-rescan")
             if self.mtag:
                 for n in range(max(1, self.args.mtag_mt)):
                     Daemon(self._tagger, "tagger-{}".format(n))
@@ -749,19 +750,18 @@ class Up2k(object):
         maxage = self.args.shr_rt * 60
         low = now - maxage
 
-        vn = self.vfs.nodes.get(self.args.shr.strip("/"))
-        active = vn and vn.nodes
+        nodes = self.vfs.all_nodes
+        shr = self.args.shr.strip("/")
 
         db = sqlite3.connect(self.args.shr_db, timeout=2)
         cur = db.cursor()
 
         q = "select k from sh where t1 and t1 <= ?"
-        rm = [x[0] for x in cur.execute(q, (now,))] if active else []
-        if rm:
-            assert vn and vn.nodes  # type: ignore
-            # self.log("chk_shr: %d" % (len(rm),))
-            zss = set(rm)
-            rm = [zs for zs in vn.nodes if zs in zss]
+        rm = []
+        for (key,) in cur.execute(q, (now,)):
+            vn = nodes.get(vjoin(shr, key.lstrip("/")))
+            if vn and vn.shr_key == key:
+                rm.append(key)
         reload = bool(rm)
         if reload:
             self.log("disabling expired shares %s" % (rm,))

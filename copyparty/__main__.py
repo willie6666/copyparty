@@ -1483,6 +1483,7 @@ def add_share(ap):
     ap2.add_argument("--shr-adm", metavar="U,U", type=u, default="", help="comma-separated list of users allowed to view/delete any share")
     ap2.add_argument("--shr-rt", metavar="MIN", type=int, default=1440, help="shares can be revived by their owner if they expired less than MIN minutes ago; [\033[32m60\033[0m]=hour, [\033[32m1440\033[0m]=day, [\033[32m10080\033[0m]=week")
     ap2.add_argument("--shr-site", metavar="URL", type=u, default="--site", help="public URL to assume when creating share-links; example: [\033[32mhttps://example.com/\033[0m]")
+    ap2.add_argument("--shr-path", action="store_true", help="allow public shares at custom paths and list them in the --shr folder")
     ap2.add_argument("--shr-v", action="store_true", help="debug")
 
 

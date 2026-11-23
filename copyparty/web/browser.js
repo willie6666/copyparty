@@ -394,6 +394,9 @@ if (1)
 		"fs_rand": "🎲 rand.name",
 		"fs_go": "✅ create share",
 		"fs_name": "name",
+		"fs_path": "public path",
+		"fs_public": "show in the public directory",
+		"fs_ppath": "for example, python/aaa.py",
 		"fs_src": "source",
 		"fs_pwd": "passwd",
 		"fs_exp": "expiry",
@@ -4065,7 +4068,8 @@ var fileman = (function () {
 		}
 		shui.style.display = 'block';
 
-		var wr = has(perms, 'write') && !fns.length;
+		var wr = has(perms, 'write') && !fns.length,
+			can_path = window.shr_path && has(perms, 'read');
 		var nope = ['admin', 'move', 'delete', 'upget'];
 		if (!wr)
 			nope.push('write');
@@ -4078,9 +4082,10 @@ var fileman = (function () {
 			'<button id="sh_rand">' + L.fs_rand + '</button>',
 			'<button id="sh_apply">' + L.fs_go + '</button>',
 			'</td></tr>',
-			'<tr><td>' + L.fs_name + '</td><td><input type="text" id="sh_k" ' + NOAC + ' placeholder="  ' + L.fs_pname + '" /></td></tr>',
+			can_path ? '<tr><td colspan="2"><label><input type="checkbox" id="sh_path" checked /> ' + L.fs_public + '</label></td></tr>' : '',
+			'<tr><td id="sh_label">' + L.fs_name + '</td><td><input type="text" id="sh_k" ' + NOAC + ' placeholder="  ' + L.fs_pname + '" /></td></tr>',
 			'<tr><td>' + L.fs_src + '</td><td><input type="text" id="sh_vp" ' + NOAC + ' readonly tt="' + L.fs_tsrc + '" /></td></tr>',
-			'<tr><td>' + L.fs_pwd + '</td><td><input type="text" id="sh_pw" ' + NOAC + ' placeholder="  ' + L.fs_ppwd + '" /></td></tr>',
+			'<tr id="sh_passwd"><td>' + L.fs_pwd + '</td><td><input type="text" id="sh_pw" ' + NOAC + ' placeholder="  ' + L.fs_ppwd + '" /></td></tr>',
 			'<tr><td>' + L.fs_exp + '</td><td class="exs">',
 			'<input type="text" id="sh_exm" ' + NOAC + ' /> ' + L.fs_tmin + ' / ',
 			'<input type="text" id="sh_exh" ' + NOAC + ' /> ' + L.fs_thrs + ' / ',
@@ -4094,7 +4099,7 @@ var fileman = (function () {
 				html.push('<a href="#" class="tgl btn">' + perms[a] + '</a>');
 
 		if (wr)
-			html.push('<a href="#" class="btn">write-only</a>');
+			html.push('<a href="#" id="sh_wo" class="btn">write-only</a>');
 
 		html.push('</td></tr><table></div>');
 		shui.innerHTML = html.join('\n');
@@ -4106,6 +4111,7 @@ var fileman = (function () {
 			exm = ebi('sh_exm'),
 			exh = ebi('sh_exh'),
 			exd = ebi('sh_exd'),
+			sh_path = ebi('sh_path'),
 			sh_k = ebi('sh_k'),
 			sh_vp = ebi('sh_vp'),
 			sh_pw = ebi('sh_pw');
@@ -4158,6 +4164,8 @@ var fileman = (function () {
 			pbtns[a].onclick = shspf;
 
 		function shspf() {
+			if (sh_path && sh_path.checked && this.textContent == 'read')
+				return;
 			clmod(this, 'on', 't');
 			if (this.textContent == 'write-only')
 				for (var a = 0; a < pbtns.length; a++)
@@ -4166,6 +4174,20 @@ var fileman = (function () {
 				clmod(pbtns[0], 'on');
 		}
 		clmod(pbtns[0], 'on', 1);
+		if (sh_path) {
+			sh_path.onchange = function () {
+				var on = this.checked;
+				ebi('sh_label').textContent = on ? L.fs_path : L.fs_name;
+				sh_k.placeholder = on ? L.fs_ppath : L.fs_pname;
+				sh_k.value = '';
+				sh_rand.style.display = ebi('sh_passwd').style.display = on ? 'none' : '';
+				if (wr)
+					ebi('sh_wo').style.display = on ? 'none' : '';
+				if (on)
+					clmod(pbtns[0], 'on', 1);
+			};
+			sh_path.onchange();
+		}
 
 		var vpt = vp;
 		if (fns.length) {
@@ -4176,6 +4198,8 @@ var fileman = (function () {
 		sh_vp.value = vpt;
 
 		sh_k.oninput = function (e) {
+			if (sh_path && sh_path.checked)
+				return;
 			var v = this.value,
 				v2 = v.replace(/[^0-9a-zA-Z-]/g, '_');
 
@@ -4202,6 +4226,11 @@ var fileman = (function () {
 		}
 
 		sh_apply.onclick = function () {
+			var path_mode = sh_path && sh_path.checked;
+			if (!sh_k.value && path_mode) {
+				sh_k.focus();
+				return;
+			}
 			if (!sh_k.value)
 				sh_rand.click();
 
@@ -4214,12 +4243,12 @@ var fileman = (function () {
 			toast.inf(30, L.fs_w8);
 
 			var body = {
-				"k": sh_k.value,
 				"vp": fns.length ? fns : [sh_vp.value],
-				"pw": sh_pw.value,
+				"pw": path_mode ? '' : sh_pw.value,
 				"exp": exm.value,
 				"perms": plist,
 			};
+			body[path_mode ? 'path' : 'k'] = sh_k.value;
 			var xhr = new XHR();
 			xhr.open('POST', SR + '/?share', true);
 			xhr.setRequestHeader('Content-Type', 'text/plain');
@@ -4227,7 +4256,8 @@ var fileman = (function () {
 			xhr.send(JSON.stringify(body));
 		};
 
-		setTimeout(sh_pw.focus.bind(sh_pw), 1);
+		var focus = sh_path ? sh_k : sh_pw;
+		setTimeout(focus.focus.bind(focus), 1);
 	};
 
 	r.rename = function (e) {

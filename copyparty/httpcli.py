@@ -33,7 +33,7 @@ except:
 
 from .__init__ import ANYWIN, PY2, RES, RESM, TYPE_CHECKING, EnvParams, unicode
 from .__version__ import S_VERSION
-from .authsrv import LEELOO_DALLAS, VFS  # typechk
+from .authsrv import LEELOO_DALLAS, SHR_DIR_STAT, VFS  # typechk
 from .bos import bos
 from .qrkode import qr2svg, qrgen
 from .star import StreamTar
@@ -105,6 +105,7 @@ from .util import (
     read_socket_chunked,
     read_socket_unbounded,
     read_utf8,
+    relchk,
     ren_open,
     runhook,
     s2hms,
@@ -922,6 +923,9 @@ class HttpCli(object):
             self.html_head += vn.flags["html_head_s"]
 
         try:
+            if rem and (vn.shr_dir or vn.shr_file):
+                return self.tx_404() and False
+
             cors_k = self._cors()
             if self.mode in ("GET", "HEAD"):
                 return self.handle_get() and self.keepalive
@@ -1961,6 +1965,8 @@ class HttpCli(object):
         vn = self.vn
         rem = self.rem
         tap = vn.canonical(rem)
+        if vn.shr_file and "\0" in tap:
+            raise Pebkac(404)
 
         if "davauth" in vn.flags and self.uname == "*":
             raise Pebkac(401, "authenticate")
@@ -2072,7 +2078,13 @@ class HttpCli(object):
                         zsl = exclude_dothidden(zsl, fsroot)
                     else:
                         zsl = exclude_dotfiles(zsl)
-                fgen += [{"vp": v, "st": vst} for v in zsl]
+                for v in zsl:
+                    dvn = vfs_virt[v]
+                    try:
+                        vst2 = bos.stat(dvn.canonical("")) if dvn.shr_file else vst
+                    except (OSError, ValueError):
+                        continue
+                    fgen.append({"vp": v, "st": vst2})
 
         else:
             t = "invalid depth value '{}' (must be either '0' or '1'{})"
@@ -4936,7 +4948,7 @@ class HttpCli(object):
         # force download
 
         if "dl" in self.ouparam:
-            cdis = self.ouparam["dl"] or req_path
+            cdis = self.ouparam["dl"] or (self.vpath if self.vn.shr_file else req_path)
             zs = gen_content_disposition(os.path.basename(cdis))
             self.out_headers["Content-Disposition"] = zs
         else:
@@ -6207,6 +6219,11 @@ class HttpCli(object):
                     continue
                 try:
                     dvn, drem = vfs.get(vjoin(top, x), self.uname, False, False)
+                    if dvn.shr_file:
+                        continue
+                    if dvn.shr_dir:
+                        dirs.append(quotep(x))
+                        continue
                     if not dvn.realpath and not dvn.nodes:
                         continue
                     if (
@@ -6284,7 +6301,7 @@ class HttpCli(object):
         nfi, vfi = str_anchor(sfilt)
         lm = "ups %d%r" % (nfi, sfilt)
 
-        if self.args.shr and self.vpath.startswith(self.args.shr1):
+        if self.vn.shr_src:
             shr_dbv, shr_vrem = self.vn.get_dbv(self.rem)
         else:
             shr_dbv = None
@@ -6628,6 +6645,10 @@ class HttpCli(object):
 
         q = "select vp from sf where k=? limit 99"
         for r in rows:
+            skey = r[0]
+            path = skey.lstrip("/")
+            suffix = "" if skey.startswith("/") and r[4] == 1 else "/"
+            r.extend((path, quotep(path) + suffix))
             if not r[4]:
                 r[4] = "---"
             else:
@@ -6660,7 +6681,7 @@ class HttpCli(object):
                 raise Pebkac(500, "sqlite3 not found on server; sharing is disabled")
             raise Pebkac(500, "server busy, cannot create share; please retry in a bit")
 
-        skey = self.uparam.get("skey") or self.vpath.split("/")[-1]
+        skey = self.uparam.get("skey") or self.vn.shr_key or self.vpath.split("/")[-1]
 
         if self.args.shr_v:
             self.log("handle_eshare: " + skey)
@@ -6686,8 +6707,7 @@ class HttpCli(object):
         if act == "rm":
             cur.execute("delete from sh where k = ?", (skey,))
             cur.execute("delete from sf where k = ?", (skey,))
-            if skey in self.asrv.vfs.nodes[self.args.shr.strip("/")].nodes:
-                reload = True
+            reload = True
         else:
             now = time.time()
             if expiry < now:
@@ -6704,7 +6724,7 @@ class HttpCli(object):
         self.redirect("", "?shares")
         return True
 
-    def handle_share(self, req: dict[str, str]) -> bool:
+    def handle_share(self, req: dict[str, Any]) -> bool:
         idx = self.conn.get_u2idx()
         if not idx or not hasattr(idx, "p_end"):
             if not HAVE_SQLITE3:
@@ -6714,9 +6734,36 @@ class HttpCli(object):
         if self.args.shr_v:
             self.log("handle_share: " + json.dumps(req, indent=4))
 
-        skey = req["k"]
+        is_path = "path" in req
+        if is_path:
+            if not self.args.shr_path:
+                raise Pebkac(400, "public share paths require --shr-path")
+            path = req["path"]
+            if (
+                not isinstance(path, (str, unicode))
+                or len(path) > 1024
+                or relchk(path)
+                or RE_CC.search(path)
+                or "\\" in path
+                or any(
+                    not x or x.startswith(".") or x != x.strip()
+                    for x in path.split("/")
+                )
+                or undot(path) != path
+                or (VPTL_OS and path.translate(VPTL_OS) != path)
+            ):
+                raise Pebkac(400, "enter a valid relative share path")
+            skey = "/" + path
+        else:
+            skey = req["k"]
+            if not re.match(r"^[0-9a-zA-Z_-]+\Z", skey):
+                t = "share names can use letters, numbers, underscores and hyphens"
+                raise Pebkac(400, t)
+
         vps = req["vp"]
         fns = []
+        if not vps:
+            raise Pebkac(400, "select a file or folder to share")
         if len(vps) == 1:
             vp = vps[0]
             if not vp.endswith("/"):
@@ -6739,28 +6786,24 @@ class HttpCli(object):
         if self.is_vproxied and (vp == self.args.R or vp.startswith(self.args.RS)):
             vp = vp[len(self.args.RS) :]
 
-        m = re.search(r"([^0-9a-zA-Z_-])", skey)
-        if m:
-            raise Pebkac(400, "sharekey has illegal character %r" % (m[1],))
-
-        if vp.startswith(self.args.shr1):
+        if vp == self.args.shr1.rstrip("/") or vp.startswith(self.args.shr1):
             raise Pebkac(400, "yo dawg...")
 
         cur = idx.get_shr()
         if not cur:
             raise Pebkac(400, "huh, sharing must be disabled in the server config...")
 
-        q = "select * from sh where k = ?"
-        qr = cur.execute(q, (skey,)).fetchall()
-        if qr and qr[0]:
-            self.log("sharekey taken by %r" % (qr,))
-            raise Pebkac(400, "sharekey %r is already in use" % (skey,))
-
         # ensure user has requested perms
         s_rd = "read" in req["perms"]
         s_wr = "write" in req["perms"]
         s_get = "get" in req["perms"]
         s_dot = "dot" in req["perms"]
+        if is_path:
+            if not s_rd or req.get("pw"):
+                t = "public share paths require read access and an empty password"
+                raise Pebkac(400, t)
+            if fns and s_wr:
+                raise Pebkac(400, "write access requires sharing a folder")
         # will_read, will_write, will_move, will_del, will_get
         s_axs = [s_rd, s_wr, False, False, s_get]
         s_axsd = s_axs + [s_dot]
@@ -6770,6 +6813,8 @@ class HttpCli(object):
 
         try:
             vfs, rem = self.asrv.vfs.get(vp, self.uname, *s_axs)
+            if vfs.shr_dir or vfs.shr_src:
+                raise Exception()
             can_dot = self.uname in vfs.axs.udot
             if s_dot and not can_dot:
                 raise Exception()
@@ -6793,6 +6838,11 @@ class HttpCli(object):
             if fn not in rfns:
                 raise Pebkac(400, "selected file not found on disk: %r" % (fn,))
 
+        if is_path and len(fns) == 1:
+            src = vfs.canonical(vjoin(rem, fns[0]))
+            if not bos.path.isfile(src) or vfs.chk_ap(src) != vfs:
+                raise Pebkac(400, "selected file is not accessible: %r" % (fns[0],))
+
         pw = req.get("pw") or ""
         pw = self.asrv.ah.hash(pw)
         now = int(time.time())
@@ -6801,36 +6851,54 @@ class HttpCli(object):
         exp = now + exp * 60 if exp else 0
         pr = "".join(zc for zc, zb in zip("rwmdg.", s_axsd) if zb)
 
-        q = "insert into sh values (?,?,?,?,?,?,?,?)"
-        cur.execute(q, (skey, pw, vp, pr, len(fns), self.uname, now, exp))
+        path = skey.lstrip("/")
+        with cur.connection:
+            cur.execute("begin immediate")
+            q = "select k from sh"
+            if is_path:
+                keys = cur.execute(q).fetchall()
+            else:
+                q += " where k = ? or substr(k,1,1) = '/'"
+                keys = cur.execute(q, (skey,)).fetchall()
+            for (key,) in keys:
+                other = key.lstrip("/")
+                if (
+                    path == other
+                    or path.startswith(other + "/")
+                    or other.startswith(path + "/")
+                ):
+                    raise Pebkac(400, "share path %r overlaps an existing share" % path)
 
-        q = "insert into sf values (?,?)"
-        for fn in fns:
-            cur.execute(q, (skey, fn))
+            q = "insert into sh values (?,?,?,?,?,?,?,?)"
+            cur.execute(q, (skey, pw, vp, pr, len(fns), self.uname, now, exp))
+            if fns:
+                cur.executemany("insert into sf values (?,?)", [(skey, fn) for fn in fns])
 
-        cur.connection.commit()
         self.conn.hsrv.broker.ask("reload", False, True).get()
         self.conn.hsrv.broker.ask("up2k.wake_rescanner").get()
 
-        fn = quotep(fns[0]) if len(fns) == 1 else ""
+        if is_path and len(fns) == 1:
+            dest = quotep(path)
+        else:
+            dest = quotep(path) + "/"
+            if len(fns) == 1:
+                dest += quotep(fns[0])
 
         # NOTE: several clients (frontend, party-up) expect url at response[15:]
         if self.args.shr_site:
-            surl = "created share: %s%s%s%s/%s" % (
+            surl = "created share: %s%s%s%s" % (
                 self.args.shr_site[:-1],
                 self.args.SR,
                 self.args.shr,
-                skey,
-                fn,
+                dest,
             )
         else:
-            surl = "created share: %s://%s%s%s%s/%s" % (
+            surl = "created share: %s://%s%s%s%s" % (
                 "https" if self.is_https else "http",
                 self.host,
                 self.args.SR,
                 self.args.shr,
-                skey,
-                fn,
+                dest,
             )
         self.loud_reply(surl, status=201)
         return True
@@ -7079,7 +7147,7 @@ class HttpCli(object):
         dbv, vrem = vn.get_dbv(rem)
 
         try:
-            st = bos.stat(abspath)
+            st = SHR_DIR_STAT if vn.shr_dir else bos.stat(abspath)
         except:
             if "on404" not in vn.flags:
                 return self.tx_404(not self.can_read)
@@ -7113,7 +7181,7 @@ class HttpCli(object):
             elif vn.flags["og_ua"]:
                 add_og = vn.flags["og_ua"].search(self.ua)
 
-        if "v" in self.uparam:
+        if "v" in self.uparam and not vn.shr_file and not vn.shr_dir:
             add_og = True
 
         if "b" in self.uparam and "norobots" not in vn.flags:
@@ -7525,13 +7593,17 @@ class HttpCli(object):
         for fn in ls_names:
             href = base + fn
 
-            if fn in vfs_virt:
-                fspath = vfs_virt[fn].realpath
+            dvn = vfs_virt.get(fn)
+            if dvn:
+                fspath = dvn.canonical("") if dvn.shr_file else dvn.realpath
             else:
                 fspath = fsroot + "/" + fn
 
             try:
-                linf = stats.get(fn) or bos.lstat(fspath)
+                if dvn and dvn.shr_dir:
+                    linf = SHR_DIR_STAT
+                else:
+                    linf = stats.get(fn) or bos.lstat(fspath)
                 inf = bos.stat(fspath) if stat.S_ISLNK(linf.st_mode) else linf
             except:
                 self.log("broken symlink: %r" % (fspath,))
@@ -7618,7 +7690,8 @@ class HttpCli(object):
             dirs = []
 
         if (
-            self.cookies.get("idxh") == "y"
+            not vn.shr_dir
+            and self.cookies.get("idxh") == "y"
             and "ls" not in self.uparam
             and "v" not in self.uparam
             and not is_opds
@@ -7733,7 +7806,7 @@ class HttpCli(object):
         ):
             logues[1] = "this folder is empty"
 
-        if "descript.ion" in lnames and os.path.isfile(
+        if not vn.shr_dir and "descript.ion" in lnames and os.path.isfile(
             os.path.join(abspath, lnames["descript.ion"])
         ):
             rem = []
@@ -7786,9 +7859,13 @@ class HttpCli(object):
             if dfn and dfn != doc:
                 # found Foo but want FOO
                 dfn = next((x for x in files if x["name"] == doc), None)
-            if dfn:
-                docpath = os.path.join(abspath, doc)
-                sz = bos.path.getsize(docpath)
+            docnode = vfs_virt.get(doc) if vn.shr_dir else None
+            if dfn and (not vn.shr_dir or (docnode and docnode.shr_file)):
+                docpath = docnode.canonical("") if docnode else os.path.join(abspath, doc)
+                try:
+                    sz = bos.path.getsize(docpath)
+                except (OSError, ValueError):
+                    raise Pebkac(404)
                 if sz < 1024 * self.args.txt_max:
                     doctxt = read_utf8(self.log, fsenc(docpath), False)
                     if doc.lower().endswith(".md") and "exp" in vn.flags:

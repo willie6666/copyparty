@@ -103,6 +103,8 @@ UP_MTE_MAP = {  # db-order
     "up_by": "un",
 }
 
+SHR_DIR_STAT = os.stat_result((stat.S_IFDIR | 0o555, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
 SEE_LOG = "see log for details"
 SEESLOG = " (see fileserver log for details)"
 SSEELOG = " ({})".format(SEE_LOG)
@@ -435,6 +437,9 @@ class VFS(object):
         self.shr_src: Optional[tuple[VFS, str]] = None  # source vfs+rem of a share
         self.shr_files: set[str] = set()  # filenames to include from shr_src
         self.shr_owner: str = ""  # uname
+        self.shr_key = ""  # database key; public paths start with a slash
+        self.shr_dir = False  # virtual directory in the public share tree
+        self.shr_file = False  # share mounted at the file itself
         self.shr_all_aps: list[tuple[str, list[VFS]]] = []
         self.aread: dict[str, list[str]] = {}
         self.awrite: dict[str, list[str]] = {}
@@ -787,6 +792,16 @@ class VFS(object):
 
         return os.path.join(ad, fn)
 
+    def _canonical_shr_file(self, rem: str, resolve: bool = True) -> str:
+        assert self.shr_src  # !rm
+        if not rem:
+            vn, srem = self.shr_src
+            ap = vn.canonical(srem)
+            if bos.path.isfile(ap) and vn.chk_ap(ap) == vn:
+                return ap
+
+        return "\n\n\0\n\n"
+
     def _ls_nope(
         self, *a, **ka
     ) -> tuple[str, list[tuple[str, os.stat_result]], dict[str, "VFS"]]:
@@ -806,6 +821,20 @@ class VFS(object):
         abspath, real, _ = vn.ls(rem, "\n", scandir, permsets, lstat, throw)
         real = [x for x in real if os.path.basename(x[0]) in self.shr_files]
         return abspath, real, {}
+
+    def _ls_shr_dir(
+        self,
+        rem: str,
+        uname: str,
+        scandir: bool,
+        permsets: list[list[bool]],
+        lstat: bool = False,
+        throw: bool = False,
+    ) -> tuple[str, list[tuple[str, os.stat_result]], dict[str, "VFS"]]:
+        ap, real, virt = self._ls(rem, uname, scandir, permsets, lstat, throw)
+        return ap, real, {
+            k: vn for k, vn in virt.items() if vn.shr_dir or vn.shr_key.startswith("/")
+        }
 
     def _ls_xvd(
         self,
@@ -924,7 +953,8 @@ class VFS(object):
         dbv, vrem = self.get_dbv(rem)
 
         if (
-            seen
+            fsroot
+            and seen
             and (not fsroot.startswith(seen[-1]) or fsroot == seen[-1])
             and fsroot in seen
         ):
@@ -973,7 +1003,7 @@ class VFS(object):
             return
 
         for n, vfs in sorted(vfs_virt.items()):
-            if not dots_ok and n.startswith("."):
+            if vfs.shr_file or (not dots_ok and n.startswith(".")):
                 continue
 
             wrel = (rel + "/" + n).lstrip("/")
@@ -1013,6 +1043,17 @@ class VFS(object):
 
             for f in [{"vp": v, "ap": a, "st": n[1]} for v, a, n in ret]:
                 yield f
+
+            for name, vn in list(vd.items()):
+                if not vn.shr_file:
+                    continue
+                vd.pop(name)
+                ap = vn.canonical("")
+                try:
+                    st = bos.stat(ap)
+                except (OSError, ValueError):
+                    continue
+                yield {"vp": vjoin(vpath, name), "ap": ap, "st": st}
 
             if not dirs:
                 continue
@@ -2052,19 +2093,33 @@ class AuthSrv(object):
         enshare = self.args.shr
         shr = enshare[1:-1]
         shrs = enshare[1:]
+        shares = {}
         if enshare:
             assert sqlite3  # type: ignore  # !rm
+            if shr in vfs.all_nodes:
+                t = "invalid config: a volume is overlapping with the --shr global-option (/%s)"
+                self.log(t % (shr,), 1)
+                raise Exception(t % (shr,))
 
-            shv = VFS(self.log_func, "", shr, shr, AXS(), self.vf0())
+            axs = AXS(["*"] if self.args.shr_path else [])
+            shv = VFS(self.log_func, "", shr, shr, axs, self.vf0())
+            if self.args.shr_path:
+                shv.shr_dir = True
+                shv.ls = shv._ls_shr_dir
+                vfs.all_nodes[shr] = shv
 
             db_path = self.args.shr_db
             db = sqlite3.connect(db_path)
+            db.execute("begin")
             cur = db.cursor()
             cur2 = db.cursor()
             now = time.time()
             for row in cur.execute("select * from sh"):
                 s_k, s_pw, s_vp, s_pr, s_nf, s_un, s_t0, s_t1 = row
-                if s_t1 and s_t1 < now:
+                if not s_k or (s_t1 and s_t1 < now):
+                    continue
+                is_path = s_k.startswith("/")
+                if is_path and not self.args.shr_path:
                     continue
 
                 if self.args.shr_v:
@@ -2094,14 +2149,23 @@ class AuthSrv(object):
 
                 # don't know the abspath yet + wanna ensure the user
                 # still has the privs they granted, so nullmap it
-                vp = "%s/%s" % (shr, s_k)
-                shv.nodes[s_k] = VFS(self.log_func, "", vp, vp, s_axs, shv.flags.copy())
-
-            vfs.nodes[shr] = vfs.all_vols[shr] = shv
-            for vol in shv.nodes.values():
-                vfs.all_vols[vol.vpath] = vfs.all_nodes[vol.vpath] = vol
+                vp = vjoin(shr, s_k.lstrip("/"))
+                vol = VFS(self.log_func, "", vp, vp, s_axs, shv.flags.copy())
+                vol.shr_key = s_k
                 vol.get_dbv = vol._get_share_src
                 vol.ls = vol._ls_nope
+                vfs.all_vols[vp] = vfs.all_nodes[vp] = vol
+
+                fns = []
+                if s_nf:
+                    q = "select vp from sf where k = ?"
+                    fns = [x[0] for x in cur2.execute(q, (s_k,))]
+                shares[s_k] = (vol, s_vp, s_pr, s_un, s_nf, fns)
+
+            cur2.close()
+            cur.close()
+            db.close()
+            vfs.nodes[shr] = vfs.all_vols[shr] = shv
 
         zss = set(acct)
         zss.update(self.idp_accs)
@@ -2130,7 +2194,9 @@ class AuthSrv(object):
             for usr in unames:
                 for vp, vol in vfs.all_vols.items():
                     zx = getattr(vol.axs, axs_key)
-                    if usr in zx and (not enshare or not vp.startswith(shrs)):
+                    if usr in zx and (
+                        not enshare or (vp != shr and not vp.startswith(shrs))
+                    ):
                         umap[usr].append(vp)
                 umap[usr].sort()
             setattr(vfs, "a" + perm, umap)
@@ -3269,7 +3335,6 @@ class AuthSrv(object):
             if not sys.platform.startswith("linux"):
                 self.log(t % "your OS is not Linux", 1)
 
-        self.vfs = vfs
         self.acct = acct
         self.defpw = defpw
         self.grps = grps
@@ -3307,14 +3372,12 @@ class AuthSrv(object):
                 for x, y in vfs.all_vols.items()
                 if x != shr and not x.startswith(shrs)
             }
+            if shv.shr_dir:
+                for flag in "dk dks dky e2d e2t fk og on404 show_hist".split():
+                    shv.flags.pop(flag, None)
+                shv.flags.update(du_iwho=0, emb_lgs=[], emb_mds=[], shr_who="no")
 
-            assert db and cur and cur2 and shv  # type: ignore
-            for row in cur.execute("select * from sh"):
-                s_k, s_pw, s_vp, s_pr, s_nf, s_un, s_t0, s_t1 = row
-                shn = shv.nodes.get(s_k, None)
-                if not shn:
-                    continue
-
+            for s_k, (shn, s_vp, s_pr, s_un, s_nf, fns) in shares.items():
                 try:
                     s_vfs, s_rem = vfs.get(
                         s_vp,
@@ -3325,18 +3388,26 @@ class AuthSrv(object):
                         "d" in s_pr,
                         "g" in s_pr,
                     )
+                    if s_vfs == shv or s_vfs.shr_dir or s_vfs.shr_src:
+                        raise Pebkac(400, "cannot share another share")
+                    if s_nf and not fns:
+                        raise Pebkac(404, "missing file selection")
+                    shn.shr_file = s_k.startswith("/") and s_nf == 1
+                    if shn.shr_file:
+                        s_rem = vjoin(s_rem, fns[0])
+                        src, src_rem = vfs.get(vjoin(s_vp, fns[0]), s_un, True, False)
+                        if src != s_vfs or src_rem != s_rem:
+                            raise Pebkac(403, "source file is shadowed by a volume")
                 except Exception as ex:
                     t = "removing share [%s] by [%s] to [%s] due to %r"
                     self.log(t % (s_k, s_un, s_vp, ex), 3)
-                    shv.nodes.pop(s_k)
+                    vfs.all_nodes.pop(shn.vpath, None)
                     continue
 
-                fns = []
-                if s_nf:
-                    q = "select vp from sf where k = ?"
-                    for (s_fn,) in cur2.execute(q, (s_k,)):
-                        fns.append(s_fn)
-
+                if shn.shr_file:
+                    shn.canonical = shn.dcanonical = shn._canonical_shr_file
+                    shn.ls = shn._ls_nope
+                elif s_nf:
                     shn.shr_files = set(fns)
                     shn.ls = shn._ls_shr
                     shn.canonical = shn._canonical_shr
@@ -3362,6 +3433,24 @@ class AuthSrv(object):
                 zs = "srch_excl srch_re_dots srch_re_nodot th_coversd th_coversl"
                 for zs2 in zs.split(" "):
                     shn.flags[zs2] = []
+
+                parent = shv
+                parts = s_k.lstrip("/").split("/")
+                for name in parts[:-1]:
+                    if name not in parent.nodes:
+                        vp = vjoin(parent.vpath, name)
+                        vn = VFS(self.log_func, "", vp, vp, shv.axs, shv.flags.copy())
+                        vn.uaxs = shv.uaxs
+                        vn.shr_dir = True
+                        vn.ls = vn._ls_shr_dir
+                        parent.nodes[name] = vfs.all_nodes[vp] = vn
+                    parent = parent.nodes[name]
+                parent.nodes[parts[-1]] = shn
+
+                if shn.shr_file:
+                    for flag in "og opds xlink xvd on403 on404".split():
+                        shn.flags.pop(flag, None)
+                    continue
 
                 # root.all_aps doesn't include any shares, so make a copy where the
                 # share appears in all abspaths it can provide (for example for chk_ap)
@@ -3390,8 +3479,10 @@ class AuthSrv(object):
                     self.log(t % (s_pr, s_k, s_un, s_vp, shn.realpath))
 
             # transplant shadowing into shares
-            for vn in shv.nodes.values():
-                svn, srem = vn.shr_src  # type: ignore
+            for vn, _, _, _, _, _ in shares.values():
+                if not vn.shr_src or vn.shr_file:
+                    continue
+                svn, srem = vn.shr_src
                 if "show_hist" not in vn.flags:
                     zvn = VFS(self.log_func, "", "", "", AXS(), self.vf0())
                     vn.nodes[".hist"] = zvn
@@ -3404,12 +3495,8 @@ class AuthSrv(object):
                     # hide subvolume
                     vn.nodes[zs] = VFS(self.log_func, "", "", "", AXS(), self.vf0())
 
-            cur2.close()
-            cur.close()
-            db.close()
-
         zb1 = zb2 = False
-        nodes = [self.vfs]
+        nodes = [vfs]
         while nodes:
             vn = nodes.pop()
             nodes += list(vn.nodes.values())
@@ -3444,8 +3531,8 @@ class AuthSrv(object):
         self.js_ls = {}
         self.js_htm = ""
         self.md_htm = ""
-        for vp, vn in self.vfs.all_nodes.items():
-            if enshare and vp.startswith(shrs):
+        for vp, vn in vfs.all_nodes.items():
+            if enshare and vp.startswith(shrs) and not vn.shr_dir:
                 continue  # propagates later in this func
             vf = vn.flags
             vn.js_ls = {
@@ -3478,6 +3565,7 @@ class AuthSrv(object):
                 "have_c2flac": self.args.allow_flac,
                 "have_c2wav": self.args.allow_wav,
                 "have_shr": self.args.shr,
+                "shr_path": self.args.shr_path,
                 "shr_who": vf["shr_who"],
                 "have_zip": not self.args.no_zip,
                 "have_zls": not self.args.no_zls,
@@ -3547,18 +3635,6 @@ class AuthSrv(object):
             vn.md_htm = json_hesc(json.dumps(md_htm))
 
         vols = list(vfs.all_nodes.values())
-        if enshare:
-            assert shv  # type: ignore  # !rm
-            for vol in shv.nodes.values():
-                if vol.vpath not in vfs.all_nodes:
-                    self.log("BUG: /%s not in all_nodes" % (vol.vpath,), 1)
-                    vols.append(vol)
-            if shr in vfs.all_nodes:
-                t = "invalid config: a volume is overlapping with the --shr global-option (/%s)"
-                t = t % (shr,)
-                self.log(t, 1)
-                raise Exception(t)
-
         for vol in vols:
             dbv = vol.get_dbv("")[0]
             vol.js_ls = vol.js_ls or dbv.js_ls or {}
@@ -3567,6 +3643,8 @@ class AuthSrv(object):
 
             zs = str(vol.flags.get("tcolor") or self.args.tcolor)
             vol.flags["tcolor"] = zs.lstrip("#")
+
+        self.vfs = vfs
 
     def setup_auth_ord(self) -> None:
         ao = [x.strip() for x in self.args.auth_ord.split(",")]
