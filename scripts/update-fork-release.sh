@@ -4,6 +4,7 @@ set -euo pipefail
 upstream=9001/copyparty
 fork=willie6666/copyparty
 branch=codex/public-share-paths
+fork_source=hovudstraum
 asset_name=copyparty-sfx.py
 
 usage() {
@@ -12,11 +13,13 @@ Usage: update-fork-release.sh [--resume WORK_DIR]
        update-fork-release.sh --build-only OUTPUT [--resume WORK_DIR]
        update-fork-release.sh --deploy-file PATH [--resume WORK_DIR] -- RESTART [ARGS...]
 
-Merge the latest upstream release into the fork's public-share branch, test
-and build the SFX, then publish it to the fork. Use --build-only to save the
-tested SFX locally. On the server, --deploy-file replaces an existing SFX and
-runs the supplied restart command. Use --resume with the workspace printed
-after a failure, committing any merge conflict resolutions first.
+Merge the latest upstream release and fork source branch into the public-share
+branch, then test, build, and publish the SFX. Changes to an already released
+upstream version get the next fork revision. Use --build-only to save the
+tested SFX locally. On the server, --deploy-file installs the latest published
+revision for the selected upstream version and runs the restart command.
+Use --resume with the workspace printed after a failure, committing any merge
+conflict resolutions first.
 
 Requires git, an authenticated gh, Python 3 with venv, and the SFX build
 tools listed in docs/devnotes.md.
@@ -76,6 +79,29 @@ sha256() {
     python3 -I -S -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$1"
 }
 
+latest_fork_tag() {
+    awk -v prefix="$fork_tag_prefix" '
+        index($1, prefix) == 1 {
+            rev = substr($1, length(prefix) + 1)
+            if (rev ~ /^[1-9][0-9]*$/ && length(rev) <= 9 && rev + 0 > max) {
+                max = rev + 0
+                tag = $1
+            }
+        }
+        END { print tag }
+    '
+}
+
+remote_tag_commit() {
+    local ref="refs/tags/$1" refs
+    refs=$(git_fork ls-remote --exit-code "$fork_url" "$ref" "$ref^{}") || return
+    awk -v ref="$ref" '
+        $2 == ref { tag = $1 }
+        $2 == ref "^{}" { peeled = $1 }
+        END { print peeled ? peeled : tag }
+    ' <<< "$refs"
+}
+
 merge_into_fork() {
     if git -C "$source_dir" merge --no-edit "$1"; then
         return
@@ -114,13 +140,12 @@ trap cleanup EXIT
 if [ -z "$resume" ]; then
     printf '%s\n' "$upstream_tag" > "$work_dir/upstream-tag"
 fi
-fork_tag="${upstream_tag}-shr-path.1"
-release_url="https://github.com/$fork/releases/tag/$fork_tag"
+fork_tag_prefix="${upstream_tag}-shr-path."
 fork_url="https://github.com/$fork.git"
 source_dir="$work_dir/source"
 
 verify_published_sfx() {
-    local artifact=$1 digest actual_digest ref refs commit version suffix
+    local artifact=$1 digest actual_digest commit version suffix
     digest=$(gh release view "$fork_tag" --repo "github.com/$fork" --json body --jq .body |
         sed -nE 's/^The SHA-256 of `copyparty-sfx\.py` is `([0-9a-fA-F]{64})`\.$/\1/p' |
         tr '[:upper:]' '[:lower:]')
@@ -128,14 +153,8 @@ verify_published_sfx() {
     actual_digest=$(sha256 "$artifact")
     [ "$actual_digest" = "$digest" ] || die "Published SFX checksum mismatch for $fork_tag"
 
-    ref="refs/tags/$fork_tag"
-    refs=$(git_fork ls-remote --exit-code "$fork_url" "$ref" "$ref^{}") \
+    commit=$(remote_tag_commit "$fork_tag") \
         || die "Could not resolve the published tag $fork_tag"
-    commit=$(awk -v ref="$ref" '
-        $2 == ref { tag = $1 }
-        $2 == ref "^{}" { peeled = $1 }
-        END { print peeled ? peeled : tag }
-    ' <<< "$refs")
     version=$(python3 -I -S "$artifact" --versionb) || die "Could not read the published SFX version"
     suffix=${version#"${upstream_tag#v}"}
     if [[ "$version" == "${upstream_tag#v}-"* && "$suffix" =~ ^-[0-9]+-g([0-9a-f]{4,40})$ ]] &&
@@ -170,38 +189,57 @@ deploy_sfx() {
     printf 'Deployed %s to %s\n' "$fork_tag" "$target"
 }
 
+fork_tag=
+saved_tag=
+saved_commit=
 release_state=
 if [ -z "$build_output" ]; then
-    release_state=$(gh api --hostname github.com --paginate "repos/$fork/releases?per_page=100" --jq \
-        ".[] | select(.tag_name == \"$fork_tag\") | any(.assets[]; .name == \"$asset_name\") as \$ready |
-         if .draft then (if \$ready then \"draft-ready\" else \"draft\" end)
-         elif \$ready then \"published\" else \"missing-asset\" end")
-    case "$release_state" in
-        published)
-            printf 'Already published %s\n' "$release_url"
-            if [ -n "$deploy_file" ]; then
-                download_dir=$(mktemp -d "$work_dir/download.XXXXXXXX")
-                gh release download "$fork_tag" --repo "github.com/$fork" --pattern "$asset_name" --dir "$download_dir"
-                artifact="$download_dir/$asset_name"
-                verify_published_sfx "$artifact"
-                deploy_sfx "$artifact"
-            fi
-            exit 0
-            ;;
-        missing-asset) die "Published release is missing $asset_name at $release_url" ;;
-        draft|draft-ready|'') ;;
-        *) die "Unexpected release state for $fork_tag" ;;
-    esac
-fi
+    releases=$(gh api --hostname github.com --paginate "repos/$fork/releases?per_page=100" --jq \
+        ".[] | select(.tag_name | startswith(\"$fork_tag_prefix\")) |
+         any(.assets[]; .name == \"$asset_name\") as \$ready |
+         [.tag_name, (if .draft then (if \$ready then \"draft-ready\" else \"draft\" end)
+         elif \$ready then \"published\" else \"missing-asset\" end)] | @tsv")
 
-if [ "$(uname -s)" = Darwin ]; then
-    if ! { command -v gtar || command -v gnutar; } >/dev/null; then
-        die 'Install the macOS build tools with brew install gsed gnu-tar findutils coreutils'
+    if [ -f "$work_dir/fork-tag" ]; then
+        saved_tag=$(cat "$work_dir/fork-tag")
+        [ -n "$saved_tag" ] && [ "$(latest_fork_tag <<< "$saved_tag")" = "$saved_tag" ] \
+            || die "Invalid saved fork tag at $work_dir/fork-tag"
+        fork_tag=$saved_tag
+        if [ -f "$work_dir/build-commit" ]; then
+            saved_commit=$(cat "$work_dir/build-commit")
+        fi
+    elif [ -n "$deploy_file" ]; then
+        fork_tag=$(awk '$2 == "published" || $2 == "missing-asset" { print $1 }' <<< "$releases" |
+            latest_fork_tag)
     fi
-    for tool in gsed gfind gsort gtr gnproc gunexpand; do
-        command -v "$tool" >/dev/null \
-            || die 'Install the macOS build tools with brew install gsed gnu-tar findutils coreutils'
-    done
+
+    if [ -z "$fork_tag" ]; then
+        refs=$(git_fork ls-remote --refs "$fork_url" "refs/tags/$fork_tag_prefix*")
+        tags=$(awk '{ sub(/^refs\/tags\//, "", $2); print $2 }' <<< "$refs")
+        fork_tag=$(printf '%s\n%s\n' "$tags" "$releases" | latest_fork_tag)
+        fork_tag=${fork_tag:-"${fork_tag_prefix}1"}
+    fi
+    release_state=$(awk -v tag="$fork_tag" '$1 == tag { print $2 }' <<< "$releases")
+    release_url="https://github.com/$fork/releases/tag/$fork_tag"
+
+    if [ "$release_state" = missing-asset ]; then
+        die "Published release is missing $asset_name at $release_url"
+    fi
+    if [ "$release_state" = published ] && { [ -n "$saved_tag" ] || [ -n "$deploy_file" ]; }; then
+        if [ -n "$saved_commit" ] && [ "$(remote_tag_commit "$fork_tag")" != "$saved_commit" ]; then
+            die "Published tag $fork_tag does not match the saved build commit"
+        fi
+        printf 'Already published %s\n' "$release_url"
+        if [ -n "$deploy_file" ]; then
+            printf '%s\n' "$fork_tag" > "$work_dir/fork-tag"
+            download_dir=$(mktemp -d "$work_dir/download.XXXXXXXX")
+            gh release download "$fork_tag" --repo "github.com/$fork" --pattern "$asset_name" --dir "$download_dir"
+            artifact="$download_dir/$asset_name"
+            verify_published_sfx "$artifact"
+            deploy_sfx "$artifact"
+        fi
+        exit 0
+    fi
 fi
 
 if [ ! -d "$source_dir/.git" ]; then
@@ -218,6 +256,7 @@ fi
 git_fork -C "$source_dir" fetch --no-tags "https://github.com/$upstream.git" tag "$upstream_tag"
 upstream_commit=$(git -C "$source_dir" rev-parse "refs/tags/${upstream_tag}^{commit}")
 remote_tag=
+build_commit=
 if [ -z "$build_output" ]; then
     remote_tag=$(git_fork -C "$source_dir" ls-remote origin "refs/tags/$fork_tag")
 fi
@@ -226,17 +265,58 @@ if [ -n "$remote_tag" ]; then
     # Keep the fork tag outside refs/tags so make-sfx only sees the upstream tag.
     ref="refs/fork-releases/$fork_tag"
     git_fork -C "$source_dir" fetch --no-tags origin "refs/tags/$fork_tag:$ref"
-    build_commit=$(git -C "$source_dir" rev-parse "${ref}^{commit}")
-    git -C "$source_dir" merge-base --is-ancestor "$upstream_commit" "$build_commit" \
+    tagged_commit=$(git -C "$source_dir" rev-parse "${ref}^{commit}")
+    git -C "$source_dir" merge-base --is-ancestor "$upstream_commit" "$tagged_commit" \
         || die "Existing fork tag does not include $upstream_tag"
+    [ -z "$saved_commit" ] || [ "$tagged_commit" = "$saved_commit" ] \
+        || die "Existing fork tag $fork_tag does not match the saved build commit"
+    if [ "$release_state" != published ]; then
+        build_commit=$tagged_commit
+    fi
 else
-    [ -z "$release_state" ] || die "Draft release exists without its remote tag $fork_tag"
+    [ -z "$release_state" ] || die "Release exists without its remote tag $fork_tag"
+fi
+
+if [ -z "$build_commit" ]; then
     if [ -n "$resume" ]; then
         git_fork -C "$source_dir" fetch --no-tags origin
         merge_into_fork "refs/remotes/origin/$branch"
     fi
+    git_fork -C "$source_dir" fetch --no-tags origin \
+        "+refs/heads/$fork_source:refs/remotes/origin/$fork_source"
+    merge_into_fork "refs/remotes/origin/$fork_source"
     merge_into_fork "$upstream_commit"
     build_commit=$(git -C "$source_dir" rev-parse HEAD)
+
+    if [ "$release_state" = published ]; then
+        published_tree=$(git -C "$source_dir" rev-parse "${tagged_commit}^{tree}")
+        build_tree=$(git -C "$source_dir" rev-parse "${build_commit}^{tree}")
+        if [ "$published_tree" = "$build_tree" ]; then
+            printf 'Already published %s\n' "$release_url"
+            exit 0
+        fi
+        revision=${fork_tag#"$fork_tag_prefix"}
+        fork_tag="$fork_tag_prefix$((revision + 1))"
+        release_state=
+        remote_tag=
+    fi
+fi
+
+if [ -z "$build_output" ]; then
+    printf '%s\n' "$fork_tag" > "$work_dir/fork-tag"
+    printf '%s\n' "$build_commit" > "$work_dir/build-commit"
+    printf 'Preparing %s\n' "$fork_tag"
+    release_url="https://github.com/$fork/releases/tag/$fork_tag"
+fi
+
+if [ "$(uname -s)" = Darwin ]; then
+    if ! { command -v gtar || command -v gnutar; } >/dev/null; then
+        die 'Install the macOS build tools with brew install gsed gnu-tar findutils coreutils'
+    fi
+    for tool in gsed gfind gsort gtr gnproc gunexpand; do
+        command -v "$tool" >/dev/null \
+            || die 'Install the macOS build tools with brew install gsed gnu-tar findutils coreutils'
+    done
 fi
 
 build_dir=$(mktemp -d "$work_dir/build.XXXXXXXX")
