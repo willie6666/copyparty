@@ -68,8 +68,10 @@ from .util import (
     HAVE_PSUTIL,
     HAVE_SQLITE3,
     HAVE_ZMQ,
+    HTTPCODE,
     LOG,
     RE_ANSI,
+    SCOTS,
     URL_BUG,
     UTC,
     VERSIONS,
@@ -81,8 +83,10 @@ from .util import (
     alltrace,
     build_netmap,
     expat_ver,
+    get_adapters,
     gzip,
     html_escape,
+    iname2ips,
     load_ipr,
     load_ipu,
     lock_file,
@@ -174,6 +178,7 @@ class SvcHub(object):
         self.is_dut = False  # running in unittest; always False
         self.stopping = False
         self.stopped = False
+        self.init_mutex = threading.Lock()
         self.reload_mutex = threading.Lock()
         self.retcode = 0
         self.httpsrv_up = 0
@@ -296,6 +301,9 @@ class SvcHub(object):
             t = "WARNING: ignoring --use-fpool because multithreading (-j{}) is enabled"
             self.log("root", t.format(args.j), c=3)
             args.no_fpool = True
+
+        if args.scots:
+            HTTPCODE.update(SCOTS)
 
         args.p_nodav = [int(x.strip()) for x in args.p_nodav.split(",") if x]
         if args.dav_port and args.dav_port not in args.p:
@@ -535,9 +543,6 @@ class SvcHub(object):
 
             self.tftpd: Optional[Tftpd] = None
 
-        if args.sftp or args.ftp or args.ftps or args.tftp:
-            Daemon(self.start_ftpd, "start_tftpd")
-
         if args.smb:
             # impacket.dcerpc is noisy about listen timeouts
             sto = socket.getdefaulttimeout()
@@ -567,7 +572,7 @@ class SvcHub(object):
 
         # create netmaps early to avoid firewall gaps,
         # but the mutex blocks multiprocessing startup
-        for zs in "ipu_nm ftp_ipa_nm tftp_ipa_nm".split():
+        for zs in "ipu_nm ftp_ipa_nm sftp_ipa_nm tftp_ipa_nm".split():
             try:
                 getattr(args, zs).mutex = threading.Lock()
             except:
@@ -861,29 +866,19 @@ class SvcHub(object):
         cur.close()
         db.close()
 
-    def start_ftpd(self) -> None:
-        time.sleep(30)
-
-        if hasattr(self, "sftpd") and not self.sftpd:
-            self.restart_sftpd()
-
-        if hasattr(self, "ftpd") and not self.ftpd:
-            self.restart_ftpd()
-
-        if hasattr(self, "tftpd") and not self.tftpd:
-            self.restart_tftpd()
-
     def restart_sftpd(self) -> None:
         if not hasattr(self, "sftpd"):
             return
 
         from .sftpd import Sftpd
 
-        if self.sftpd:
-            return  # todo
+        with self.init_mutex:
+            if self.sftpd:
+                return  # todo
 
-        self.sftpd = Sftpd(self)
-        self.sftpd.run()
+            self.sftpd = Sftpd(self)
+            self.sftpd.run()
+
         self.log("root", "started SFTPd")
 
     def restart_ftpd(self) -> None:
@@ -892,13 +887,15 @@ class SvcHub(object):
 
         from .ftpd import Ftpd
 
-        if self.ftpd:
-            return  # todo
+        with self.init_mutex:
+            if self.ftpd:
+                return  # todo
 
-        if not os.path.exists(self.args.cert):
-            ensure_cert(self.log, self.args)
+            if not os.path.exists(self.args.cert):
+                ensure_cert(self.log, self.args)
 
-        self.ftpd = Ftpd(self)
+            self.ftpd = Ftpd(self)
+
         self.log("root", "started FTPd")
 
     def restart_tftpd(self) -> None:
@@ -907,10 +904,11 @@ class SvcHub(object):
 
         from .tftpd import Tftpd
 
-        if self.tftpd:
-            return  # todo
+        with self.init_mutex:
+            if self.tftpd:
+                return  # todo
 
-        self.tftpd = Tftpd(self)
+            self.tftpd = Tftpd(self)
 
     def thr_httpsrv_up(self) -> None:
         time.sleep(1 if self.args.ign_ebind_all else 5)
@@ -1139,9 +1137,20 @@ class SvcHub(object):
                 self.log("root", "WARNING: ignoring --bauth-last due to --no-bauth", 3)
 
         have_tcp = False
+        have_iname = []
+        ptn = re.compile(r"^[0-9a-f]{0,4}:|^[0-9]{1,3}\.|^no$")
         for zs in al.i:
             if not zs.startswith(("unix:", "fd:")):
                 have_tcp = True
+                if "/" in zs or not ptn.search(zs):
+                    have_iname.append(zs)
+        if have_iname:
+            nics = get_adapters()
+            for iname in have_iname:
+                for zs in iname2ips(iname, nics):
+                    if zs not in al.i:
+                        al.i.append(zs)
+                al.i.remove(iname)
         if not have_tcp:
             zb = False
             zs = "z zm zm4 zm6 zmv zmvv zs zsv zv"
@@ -1290,7 +1299,7 @@ class SvcHub(object):
 
         TH_BWRAP[:] = al.th_bwrap_b
 
-        zs = "dav_ua1 lf_url sus_urls nonsus_urls ua_nodav ua_nodoc ua_nozip"
+        zs = "acao_re dav_ua1 lf_url sus_urls nonsus_urls ua_nodav ua_nodoc ua_nozip"
         for k in zs.split(" "):
             vs = getattr(al, k)
             if not vs or vs == "no":

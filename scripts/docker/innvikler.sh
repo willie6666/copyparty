@@ -14,6 +14,13 @@ ised() {
 	tmv "$2"
 }
 
+# use custom pillow if relevant
+echo $1 | grep -qE 'im|ac|iv|dj' && [ ! -e "/z/stock_pillow" ] && (
+  cp -pv /z/packages/*.pub /etc/apk/keys/
+  cd /z/packages/$(cat /etc/apk/arch)
+  apk add ./py3-pillow-*.apk
+)
+
 # use custom ffmpeg if relevant
 echo $1 | grep -qE 'ac|iv|dj' && [ ! -e "/z/stock_ffmpeg" ] && (
   cp -pv /z/packages/*.pub /etc/apk/keys/
@@ -29,7 +36,7 @@ echo $1 | grep -qE 'ac|iv|dj' && [ ! -e "/z/stock_ffmpeg" ] && (
 rm -rf /z/packages /z/test-aac
 
 # use zlib-ng if available
-f=/z/whl/zlib_ng-0.5.1-cp312-cp312-linux_$(cat /etc/apk/arch).whl
+f=/z/whl/zlib_ng-*-linux_$(cat /etc/apk/arch).whl
 [ "$1" != min ] && [ -e $f ] && {
   apk add -t .bd !pyc py3-pip
   rm -f /usr/lib/python3*/EXTERNALLY-MANAGED
@@ -37,6 +44,14 @@ f=/z/whl/zlib_ng-0.5.1-cp312-cp312-linux_$(cat /etc/apk/arch).whl
   apk del .bd
 }
 rm -rf /z/whl
+
+# drop openjpeg; unmaintained, has vulns
+(cd /usr/lib/python3.*/site-packages/PIL
+  sed -ri /jpg_2000/d features.py
+  sed -ri /Jpeg2KIm/d __init__.py
+  sed -ri /Jpeg2KIm/d Image.py
+  rm -f Jpeg2KImagePlugin.py
+) || true
 
 # cleanup for flavors with python build steps (dj/iv)
 rm -rf /var/cache/apk/* /root/.cache

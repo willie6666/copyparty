@@ -42,6 +42,7 @@ from .util import (
     odfusion,
     read_utf8,
     relchk,
+    sanitize_fn,
     statdir,
     ub64enc,
     uncyg,
@@ -426,6 +427,7 @@ class VFS(object):
         self.root = self
         self.dev = 0  # st_dev
         self.nodes: dict[str, VFS] = {}  # child nodes
+        self.lnodes: Optional[dict[bytes, VFS]] = None  # lowercase
         self.histtab: dict[str, str] = {}  # all realpath->histpath
         self.dbpaths: dict[str, str] = {}  # all realpath->dbpath
         self.dbv: Optional[VFS] = None  # closest full/non-jump parent
@@ -468,6 +470,7 @@ class VFS(object):
             self.canonical = self._canonical_null
             self.dcanonical = self._dcanonical_null
 
+        self.get = self._get
         self.get_dbv = self._get_dbv
         self.ls = self._ls
 
@@ -575,6 +578,11 @@ class VFS(object):
         if name in self.nodes:
             return self.nodes[name]._find(rem)
 
+        if self.lnodes:
+            zs = name.casefold().encode("ascii", "ignore")
+            if zs in self.lnodes:
+                return self.lnodes[zs]._find(rem)
+
         return self, vpath
 
     def can_access(
@@ -596,7 +604,7 @@ class VFS(object):
             ret += "A"
         return ret
 
-    def get(
+    def _get(
         self,
         vpath: str,
         uname: str,
@@ -638,6 +646,42 @@ class VFS(object):
 
         return vn, rem
 
+    def _get_xvd(
+        self,
+        vpath: str,
+        uname: str,
+        will_read: bool,
+        will_write: bool,
+        will_move: bool = False,
+        will_del: bool = False,
+        will_get: bool = False,
+        err: int = 403,
+    ) -> tuple["VFS", str]:
+        zvr = self._get(
+            vpath, uname, will_read, will_write, will_move, will_del, will_get, err
+        )
+        if not zvr:
+            return None
+        vn, rem = zvr
+        if "xvd" in vn.flags and vn.realpath:
+            avn = vn.chk_ap(vn.canonical(rem))
+            if avn and avn.vpath == vn.vpath:
+                return vn, rem
+            if (
+                not avn
+                or (will_read and uname not in avn.axs.uread)
+                or (will_write and uname not in avn.axs.uwrite)
+                or (will_move and uname not in avn.axs.umove)
+                or (will_del and uname not in avn.axs.udel)
+                or (will_get and uname not in avn.axs.uget)
+            ):
+                if not err:
+                    return None
+                raise Pebkac(
+                    err, "permission denied for [/%s]" % (vjoin(vn.vpath, rem))
+                )
+        return vn, rem
+
     def _get_share_src(self, vrem: str) -> tuple["VFS", str]:
         src = self.shr_src
         if not src:
@@ -673,8 +717,6 @@ class VFS(object):
             if lfn == zs.lower():
                 hit = zs
                 break
-        if not hit:
-            return True  # NFC/NFD or something, can't be helped either way
         if self.log:
             t = "returning 404 due to underlying case-insensitive filesystem:\n  http-req: %r\n  local-fs: %r"
             self.log("vfs", t % (fn, hit))
@@ -765,6 +807,32 @@ class VFS(object):
         real = [x for x in real if os.path.basename(x[0]) in self.shr_files]
         return abspath, real, {}
 
+    def _ls_xvd(
+        self,
+        rem: str,
+        uname: str,
+        scandir: bool,
+        permsets: list[list[bool]],
+        lstat: bool = False,
+        throw: bool = False,
+    ) -> tuple[str, list[tuple[str, os.stat_result]], dict[str, "VFS"]]:
+        dirpath, real0, virt_vis = self._ls(rem, uname, scandir, permsets, True, throw)
+        lns = [x for x in real0 if stat.S_ISLNK(x[1].st_mode)]
+        if not lns:
+            return dirpath, real0, virt_vis
+        real = [x for x in real0 if not stat.S_ISLNK(x[1].st_mode)]
+        ps = (permsets[0] + [False] * 5)[:5]  # rwmdg
+        for fn, _ in lns:
+            ap = absreal(os.path.join(dirpath, fn))
+            vn = self.chk_ap(ap)
+            try:
+                if vn.get("", uname, *ps):
+                    real.append((fn, bos.stat(ap)))
+            except:
+                pass
+        real.sort()
+        return dirpath, real, virt_vis
+
     def _ls(
         self,
         rem: str,
@@ -786,6 +854,12 @@ class VFS(object):
         if not rem:
             # no vfs nodes in the list of real inodes
             real = [x for x in real if x[0] not in self.nodes]
+            if self.lnodes:
+                real = [
+                    x
+                    for x in real
+                    if x[0].casefold().encode("ascii", "ignore") not in self.lnodes
+                ]
 
             dbv = self.dbv or self
             for name, vn2 in sorted(self.nodes.items()):
@@ -859,12 +933,16 @@ class VFS(object):
                 self.log("vfs.walk", t % (seen[-1], fsroot, self.vpath, rem), 3)
             return
 
-        if "xdev" in self.flags or "xvol" in self.flags:
+        if "xvd" in self.flags:
+            ps = (permsets[0] + [False] * 5)[:5]  # rwmdg
             rm1 = []
             for le in vfs_ls:
                 ap = absreal(os.path.join(fsroot, le[0]))
                 vn2 = self.chk_ap(ap)
-                if not vn2 or not vn2.get("", uname, True, False, err=0):
+                try:
+                    if not vn2.get("", uname, *ps):
+                        raise Exception()
+                except:
                     rm1.append(le)
             _ = [vfs_ls.remove(x) for x in rm1]  # type: ignore
 
@@ -950,6 +1028,22 @@ class VFS(object):
             ret2 = list(zip(vpaths, apaths, dstats))
             for d in [{"vp": v, "ap": a, "st": n} for v, a, n in ret2]:
                 yield d
+
+    def sanitize_fn(self, fn: str, rem: Any = None) -> str:
+        fn = sanitize_fn(fn, self.flags["fsnt"])
+        if rem:
+            return fn
+        if fn in self.nodes or (
+            self.lnodes and fn.casefold().encode("ascii", "ignore") in self.lnodes
+        ):
+            raise Pebkac(400, "bad filename")
+        return fn
+
+    def chk_fn(self, fn: str) -> None:
+        if fn in self.nodes or (
+            self.lnodes and fn.casefold().encode("ascii", "ignore") in self.lnodes
+        ):
+            raise Pebkac(400, "bad filename")
 
     def chk_ap(self, ap: str, st: Optional[os.stat_result] = None) -> Optional["VFS"]:
         aps = ap + os.sep
@@ -2952,6 +3046,14 @@ class AuthSrv(object):
             excl.extend([r"^\.", r"/\."])
             vol.flags["srch_re_nodot"] = re.compile("|".join(excl))
 
+        for vol in list(vfs.all_nodes.values()):
+            if "xvd" in vol.flags:
+                for vol in vfs.all_nodes.values():
+                    vol.get = vol._get_xvd
+                    if vol.ls.__name__ == "_ls":
+                        vol.ls = vol._ls_xvd
+                break
+
         have_daw = False
         for vol in vfs.all_nodes.values():
             daw = vol.flags.get("daw") or self.args.daw
@@ -2985,6 +3087,22 @@ class AuthSrv(object):
             if vol.flags.get("dots"):
                 for name in vol.axs.uread:
                     vol.axs.udot.add(name)
+
+        zi = 1
+        zs = "; you must also enable --hack-me-bro to accept the total loss of security"
+        if self.args.hack_me_bro:
+            zi = 3
+            zs = ""
+
+        if self.args.smb:
+            t = "smb is enabled; this has serious security issues which will not be fixed"
+            self.log(t + zs, zi)
+            if zs:
+                errors = True
+
+        if self.args.tftp:
+            t = "tftp is enabled; primitive protocol with primitive access-restrictions"
+            self.log(t, 3)
 
         if errors:
             sys.exit(1)
@@ -3290,6 +3408,39 @@ class AuthSrv(object):
             cur.close()
             db.close()
 
+        zb1 = zb2 = False
+        nodes = [self.vfs]
+        while nodes:
+            vn = nodes.pop()
+            nodes += list(vn.nodes.values())
+            if (
+                not vn.realpath
+                or "bcasechk" not in vn.flags
+                or (not vn.axs.uread and not vn.axs.uwrite and not vn.axs.uget)
+            ):
+                continue
+            if ".hist" in vn.nodes and "e2d" in vn.flags:
+                zb1 = True
+            for zs, vnn in vn.nodes.items():
+                if zs != ".hist" and (vnn.realpath or "").startswith(vn.realpath):
+                    t = "nested volume on casefolding filesystem: [/%s] inside [/%s]"
+                    self.log(t % (vnn.vpath, vn.vpath), 3)
+                    zb2 = True
+            if PY2:
+                continue
+            vn.lnodes = {
+                k.casefold().encode("ascii", "ignore"): v for k, v in vn.nodes.items()
+            }
+        if zb2 and PY2:
+            t = "SECURITY WARNING: due to python2, shadowing will NOT provide much security:"
+            self.log(t, 1)
+        if zb2:
+            t = "SECURITY WARNING: you have a case-insensitive / casefolding filesystem, and you also have nested volumes (subvolumes). This combination is NOT 100% bulletproof; it *might* be possible for someone to sneakily access a subvolume they're not supposed to have access to, if they have access to the parent volume."
+            self.log(t, 3)
+        if zb1:
+            t = "you have a case-insensitive / casefolding filesystem, so it is recommended to set --hist C:\\copyparty-data\\ or another safe place"
+            self.log(t, 3)
+
         self.js_ls = {}
         self.js_htm = ""
         self.md_htm = ""
@@ -3340,6 +3491,7 @@ class AuthSrv(object):
                 "sb_md": vn.js_ls["sb_md"],
                 "sba_md": vf.get("md_sba") or "",
                 "sba_lg": vf.get("lg_sba") or "",
+                "nohtml": "nohtml" in vf,
                 "rw_edit": vf["rw_edit"],
                 "txt_ext": self.args.textfiles.replace(",", " "),
                 "def_hcols": list(vf.get("mth") or []),
@@ -3387,7 +3539,7 @@ class AuthSrv(object):
             if self.args.wopi:
                 js_htm["have_wopi"] = True
 
-            zs = "have_emp md_no_br"
+            zs = "have_emp md_no_br nohtml"
             md_htm = {x: js_htm[x] for x in zs.split(" ")}
             md_htm["modpoll_freq"] = self.args.mcr
 

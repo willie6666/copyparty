@@ -572,7 +572,7 @@ if you want to grant access to all users who are logged in, the group `acct` wil
 * to do the opposite, granting access to everyone who is NOT logged in. `*,-@acct` does the trick, for example `-v /srv/welcome:welcome:r,*,-@acct`
 * single users can also be subtracted from a group: `@admins,-james`
 
-anyone trying to bruteforce a password gets banned according to `--ban-pw`; default is 24h ban for 9 failed attempts in 1 hour
+anyone trying to bruteforce a password gets banned according to `--ban-pw` (assuming [real-ip](#real-ip) is configured correctly); default is 24h ban for 9 failed attempts in 1 hour
 
 and if you want to use config files instead of commandline args (good!) then here's the same examples as a configfile; save it as `foobar.conf` and use it like this: `python copyparty-sfx.py -c foobar.conf`
 
@@ -621,6 +621,8 @@ config file example:
 ## shadowing
 
 hiding specific subfolders  by mounting another volume on top of them
+
+> **WARNING:** shadowing is NOT bulletproof when the underlying filesystem is casefolding (case-insensitive), in other words DON'T rely on this when copyparty is running on Windows and/or MacOS. This is also unsafe when combined with certain filesystems on Linux, especially FAT32/exFAT. Pay attention to the volume-listing in the startup log; `casechk:n` indicates probably-OK, but if it says `casechk:y` then DO NOT trust shadowing to fully prevent access to a file/subfolder.
 
 for example `-v /mnt::r -v /var/empty:web/certs:` (note: no permissions) mounts the server folder `/mnt` as the webroot, but another volume is mounted at `/web/certs` -- so visitors can only see the contents of `/mnt` and `/mnt/web` (at URLs `/` and `/web`), but not `/mnt/web/certs` because URL `/web/certs` is mapped to `/var/empty`
 
@@ -1803,11 +1805,16 @@ avoid traversing into other filesystems  using `--xdev` / volflag `:c,xdev`, ski
 
 and/or you can `--xvol` / `:c,xvol` to ignore all symlinks leaving the volume's top directory, but still allow bind-mounts pointing elsewhere
 
-* symlinks are permitted with `xvol` if they point into another volume where the user also has some sort of access, keeping permissions from outer/initial volume
+* symlinks are permitted with `xvol` if they point into another volume where the user also has some sort of access
+  * usually keeps permissions from outer/initial volume, but don't take that for granted
 
-these options will reduce performance; unlikely worst-case estimates are 14% reduction for directory listings, 35% for download-as-tar
+these options will reduce performance; unlikely worst-case estimates are 27% reduction for directory listings, 35% for download-as-tar
+
+* if the underlying storage is [a network disk](#using-the-cloud-as-storage) then xvol/xdev will be **very** slow (not to mention pointless/useless)
 
 as of copyparty v1.7.0 these options also prevent file access at runtime -- in previous versions it was just hints for the indexer
+
+> **WARNING:** the `xvol` and `xdev` options should NOT be relied on for security; these are originally and primarily intended for the [e2ds indexer](#file-indexing). Certain underlying filesystems (especially FUSE-based and casefolding ones) will be problematic, and symlinks inherently have various TOCTOUs, and there's probably also bugs in copyparty where xvol/xdev is not fully enforced for certain APIs. The developer does not care about these options and they do not receive much testing.
 
 ### periodic rescan
 
@@ -3047,7 +3054,7 @@ below are some tweaks roughly ordered by usefulness:
   * and pypy can sometimes crash on startup with `-j0` (TODO make issue)
 
 * if you are running the copyparty server **on Windows or Macos:**
-  * `--casechk=n` makes it much faster, but also awakens [the usual surprises](https://github.com/9001/copyparty/issues/781) you expect from a case-insensitive filesystem
+  * `--casechk=n` makes it much faster, but [reduces security](https://github.com/9001/copyparty/security/advisories/GHSA-3c88-p299-7hvr) and awakens [the usual surprises](https://github.com/9001/copyparty/issues/781) you expect from a case-insensitive filesystem
     * this is the same as `casechk: n` in a config-file
 
 

@@ -20,7 +20,7 @@ from .__init__ import ANYWIN, PY2, TYPE_CHECKING, UNIX, WINDOWS, E
 from .authsrv import LEELOO_DALLAS, REDUP_E2, SEESLOG, VFS, AuthSrv
 from .bos import bos
 from .cfg import vf_bmap, vf_cmap, vf_vmap
-from .fsutil import Fstab
+from .fsutil import Fstab, filefrag
 from .mtag import MParser, MTag
 from .util import (
     E_FS_CRIT,
@@ -1004,7 +1004,7 @@ class Up2k(object):
             t = ""
             if n < 1 and "e2v" in vol.flags:
                 t += "+e2v"
-            if n < 2 and "redup" in vol.flags:
+            if n < 2 and vol.flags.get("redup"):
                 t += "+redup"
             if n < 3 and "e2ts" in vol.flags:
                 t += "+tags"
@@ -1179,7 +1179,7 @@ class Up2k(object):
         ft = "\033[0;32m{}{:.0}"
         ff = "\033[0;35m{}{:.0}"
         fv = "\033[0;36m{}:\033[90m{}"
-        zs = "bcasechk du_iwho emb_all emb_lgs emb_mds ext_th_d html_head html_head_d html_head_s ls_q_m put_name2 mv_re_r mv_re_t rm_re_r rm_re_t oh_f oh_g rw_edit_set srch_re_dots srch_re_nodot th_coversd th_coversl th_covers_set th_coversd_set zipmax zipmaxn_v zipmaxs_v"
+        zs = "bcasechk du_iwho emb_all emb_lgs emb_mds ext_th_d html_head html_head_d html_head_s ls_q_m put_name2 mv_re_r mv_re_t rm_re_r rm_re_t oh_f oh_g rw_edit_set srch_re_dots srch_re_nodot th_coversd th_coversl th_covers_set th_coversd_set xvd zipmax zipmaxn_v zipmaxs_v"
         fx = set(zs.split())
         fd = vf_bmap()
         fd.update(vf_cmap())
@@ -1317,7 +1317,7 @@ class Up2k(object):
             ANYWIN or UNIX or "hist_cow" in flags or "up2k.db" in os.listdir(histpath)
         ):
             try:
-                if self.fstab.get(ptop)[0] != "btrfs":
+                if self.fstab.get(histpath)[0] != "btrfs":
                     raise Exception()
                 runcmd([b"chattr", b"-c", fsenc(histpath)], 1)  # compression and...
                 runcmd([b"chattr", b"+C", fsenc(histpath)], 1)  # no-cow are incompat
@@ -2181,10 +2181,10 @@ class Up2k(object):
             for w, rd, fn in cur.execute("select w, rd, fn from up"):
                 w16 = w[:16]
                 for v2, c2 in curs:
-                    hit = c2.execute(q2, (w16, w)).fetchone()
-                    if not hit:
+                    hits = c2.execute(q2, (w16, w)).fetchall()
+                    if not hits:
                         continue
-                    rd2, fn2 = hit
+                    rd2, fn2 = hits[0]
                     if fn == fn2 and rd == rd2 and vol is v2:
                         continue
                     apt = ""
@@ -2196,11 +2196,22 @@ class Up2k(object):
                         st1 = bos.lstat(fp1)
                         if fp1 == fp2 or stat.S_ISLNK(st1.st_mode):
                             continue  # self(?), or redup failed during walk
+                        if to == "hard" and st1.st_nlink >= len(hits):
+                            continue
                         ap1 = absreal(fp1)
                         ap2 = absreal(fp2)
                         st2 = bos.lstat(ap2)
                         if stat.S_ISLNK(st2.st_mode):
                             continue  # dead hit
+                        if to == "ref" and ap1 != ap2:
+                            try:
+                                frag1 = filefrag(ap1)
+                                if frag1:
+                                    frag2 = filefrag(ap2)
+                                    if frag1 == frag2:
+                                        continue
+                            except Exception as ex:
+                                self.log("redup: filefrag failed (OK); %r" % (ex,))
                         for ap in (ap1,) if ap1 == ap2 else (ap1, ap2):
                             self.log("redup: integrity-checking %r" % (ap,))
                             zsl, st = self._hashlist_from_file(ap)
@@ -3539,7 +3550,7 @@ class Up2k(object):
                                     job["ptop"] = vfs.realpath
                                     job["vtop"] = vfs.vpath
                                     job["prel"] = rem
-                                    job["name"] = sanitize_fn(job["name"])
+                                    job["name"] = vfs.sanitize_fn(job["name"], rem)
                                     ud2 = (vfs.vpath, job["prel"], job["name"])
                                     if ud1 != ud2:
                                         # print(json.dumps(job, sort_keys=True, indent=4))
@@ -4398,7 +4409,7 @@ class Up2k(object):
             is_dir = stat.S_ISDIR(st.st_mode)
         except:
             # NOTE: "file not found" *sftpd
-            raise Pebkac(400, "file not found on disk (already deleted?)")
+            raise Pebkac(404, "file not found on disk (already deleted?)")
 
         if "bcasechk" in vn.flags and not vn.casechk(rem, False):
             raise Pebkac(400, "file does not exist case-sensitively")
@@ -5428,7 +5439,7 @@ class Up2k(object):
                     job["ptop"] = vfs.realpath
                     job["vtop"] = vfs.vpath
                     job["prel"] = rem
-                    job["name"] = sanitize_fn(job["name"])
+                    job["name"] = vfs.sanitize_fn(job["name"], rem)
                     ud2 = (vfs.vpath, job["prel"], job["name"])
                     if ud1 != ud2:
                         job["vcfg"] = vf

@@ -365,13 +365,19 @@ if PY2:
 else:
     umktrans = str.maketrans
 
-FNTL_WIN = umktrans('<>:|?*"\\/', "＜＞：｜？＊＂＼／")
 VPTL_WIN = umktrans('<>:|?*"\\', "＜＞：｜？＊＂＼")
-APTL_WIN = umktrans('<>:|?*"/', "＜＞：｜？＊＂／")
-FNTL_MAC = VPTL_MAC = APTL_MAC = umktrans(":", "：")
-FNTL_OS = FNTL_WIN if ANYWIN else FNTL_MAC if MACOS else None
+VPTL_MAC = umktrans(":", "：")
 VPTL_OS = VPTL_WIN if ANYWIN else VPTL_MAC if MACOS else None
-APTL_OS = APTL_WIN if ANYWIN else APTL_MAC if MACOS else None
+
+
+BADNAMES = []
+if ANYWIN:
+    BADNAMES += ["con", "prn", "aux", "nul"]
+    BADNAMES += ["com%s" % (n,) for n in range(1, 10)]
+    BADNAMES += ["lpt%s" % (n,) for n in range(1, 10)]
+    BADNAMES += ["com%s" % (n,) for n in ("¹", "²", "³")]
+    BADNAMES += ["lpt%s" % (n,) for n in ("¹", "²", "³")]
+BADNAMESET = set(BADNAMES)
 
 
 BOS_SEP = ("%s" % (os.sep,)).encode("ascii")
@@ -426,6 +432,37 @@ HTTPCODE = {
     999: "MissingNo",
 }
 
+# https://underwood.network/http/scots.html
+# awk <~/Documents/scots.txt /"$(awk <copyparty/util.py -F: 'o{printf"%d|",$1}/^HTTPCODE = /{o=1}/999/{print"aaa";exit}')"'/{v=$0;sub(/^[0-9]+./,"",v);printf"    %d: \"%s\",\n",$1,v}'
+SCOTS = {
+    200: "NAE BOTHER",
+    201: "THAT'S IT MADE",
+    202: "AYE AH'LL SEE TAE IT",
+    204: "HEHAW",
+    206: "HERE'S A WEE BIT",
+    207: "BIT O THIS BIT O THAT",
+    301: "WE'VE FLITTED",
+    302: "WE'RE OWER THERE THE NOO",
+    304: "SAME AULD SHITE",
+    400: "WHIT THE FUCK'S THIS",
+    401: "WHO THE FUCK ARE YOU",
+    403: "GET TAE FUCK",
+    404: "NO FUCKIN HERE PAL",
+    405: "YE CANNAE DAE THAT",
+    409: "PICK A FUCKIN LANE",
+    411: "HOW LANG IS IT THEN",
+    412: "THAT'S NO WHIT WE AGREED",
+    413: "THAT'S FUCKIN MASSIVE",
+    415: "NAE IDEA WHIT THAT IS",
+    416: "IT DISNAE GO THAT FAR",
+    422: "AH KEN WHIT YE MEAN BUT NAW",
+    423: "IT'S SNIBBED",
+    429: "SLOW DOON",
+    500: "AH'VE FUCKED IT",
+    501: "AH DINNAE DAE THAT",
+    503: "WE'RE FUCKIN SHUT",
+}
+
 
 IMPLICATIONS = [
     ["e2dsa", "e2ds"],
@@ -463,6 +500,8 @@ IMPLICATIONS = [
     ["smbvvv", "smbvv"],
     ["smbvv", "smbv"],
     ["smbv", "smb"],
+    ["xdev", "xvd"],
+    ["xvol", "xvd"],
     ["zv", "zmv"],
     ["zv", "zsv"],
     ["z", "zm"],
@@ -2429,7 +2468,7 @@ def uncyg(path: str) -> str:
     return "%s:\\%s" % (path[1], path[3:])
 
 
-def undot(path: str) -> str:
+def _undot(path: str) -> str:
     ret: list[str] = []
     for node in path.split("/"):
         if node == "." or not node:
@@ -2445,30 +2484,56 @@ def undot(path: str) -> str:
     return "/".join(ret)
 
 
-def sanitize_fn(fn: str) -> str:
-    fn = fn.replace("\\", "/").split("/")[-1]
-    if APTL_OS:
-        fn = sanitize_to(fn, APTL_OS)
+def _undot_win(path: str) -> str:
+    ret: list[str] = []
+    for node in path.replace("\\", "/").split("/"):
+        if node == "..":
+            if ret:
+                ret.pop()
+            continue
+
+        node = node.rstrip(". ")
+        if node:
+            ret.append(node)
+
+    return "/".join(ret)
+
+
+if ANYWIN:
+    undot = _undot_win
+else:
+    undot = _undot
+
+
+def sanitize_fn(fn: str, fsnt: Optional[str] = None) -> str:
+    fn = fn.replace("\x00", "_").split("/")[-1]
+    if fsnt and fsnt != "lin":
+        fn = fn.translate(VPTL_WIN if fsnt == "win" or ANYWIN else VPTL_MAC)
+    fn2 = fn.replace("\\", "/")
+    if ANYWIN or fsnt == "win" or "/../" in fn2:
+        fn = fn2.split("/")[-1].rstrip(". ")
+    if VPTL_OS:
+        fn = sanitize_to(fn, VPTL_OS)
     return fn.strip()
 
 
-def sanitize_to(fn: str, tl: dict[int, int]) -> str:
+def sanitize_to(fn: str, tl: dict[int, int], fsnt: Optional[str] = None) -> str:
     fn = fn.translate(tl)
-    if ANYWIN:
-        bad = ["con", "prn", "aux", "nul"]
-        for n in range(1, 10):
-            bad += ("com%s lpt%s" % (n, n)).split(" ")
-
-        if fn.lower().split(".")[0] in bad:
+    if ANYWIN or fsnt == "win":
+        fn = fn.rstrip(". ")
+        if fn.lower().split(".")[0].strip() in BADNAMESET:
             fn = "_" + fn
     return fn
 
 
-def sanitize_vpath(vp: str) -> str:
-    if not APTL_OS:
+def sanitize_vpath(vp: str, fsnt: Optional[str] = None) -> str:
+    vptl = VPTL_OS
+    if fsnt and fsnt != "lin":
+        vptl = VPTL_WIN if fsnt == "win" or ANYWIN else VPTL_MAC
+    if not vptl:
         return vp
     parts = vp.replace(os.sep, "/").split("/")
-    ret = [sanitize_to(x, APTL_OS) for x in parts]
+    ret = [sanitize_to(x, vptl, fsnt) for x in parts]
     return "/".join(ret)
 
 
@@ -3273,6 +3338,49 @@ def list_nics(alll: bool = False) -> dict[str, Netdev]:
             eps[zs] = Netdev(zs, idx or 0, name, "")
 
     return eps
+
+
+def iname2ips(iname: str, nics: list[Any]) -> list[str]:
+    # iname = 192.168.0.0/16 | eth0
+    ret = []
+    if "/" in iname:
+        v6 = ":" in iname
+        Addr = IPv6Address if v6 else IPv4Address
+        Net = IPv6Network if v6 else IPv4Network
+        mask = Net(iname, True)
+        for nic in nics:
+            for nip in nic.ips:
+                if v6 != (":" in str(nip.ip)):
+                    continue
+                zs = nip.ip[0] if v6 else nip.ip
+                if Addr(zs) in mask:
+                    ret.append(zs)
+    else:
+        for nic in nics:
+            if iname not in (nic.name, nic.nice_name):
+                continue
+            for nip in nic.ips:
+                if ":" in str(nip.ip):
+                    ip, _, sco = nip.ip
+                    if sco:
+                        ip = "%s%%%s" % (ip, sco)
+                else:
+                    ip = nip.ip
+                ret.append(ip)
+    return ret
+
+
+def bindtuple(ip: str, port: int) -> Union[tuple[str, int], tuple[str, int, int, int]]:
+    if not ":" in ip:
+        return (ip, port)
+    if "%" in ip:
+        ip, sco = ip.split("%")
+        try:
+            isco = int(sco)
+        except:
+            isco = socket.if_nametoindex(sco)
+        return (ip, port, 0, isco)
+    return (ip, port, 0, 0)
 
 
 def build_netmap(csv: str, defer_mutex: bool = False):

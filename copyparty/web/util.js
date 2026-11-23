@@ -853,7 +853,7 @@ function vjoin(p1, p2) {
     if (!p2)
         p2 = '';
 
-    if (p1.endsWith('/'))
+    if (p1 != '/' && p1.endsWith('/'))
         p1 = p1.slice(0, -1);
 
     if (p2.startsWith('/'))
@@ -865,7 +865,7 @@ function vjoin(p1, p2) {
     if (!p2)
         return p1;
 
-    return p1 + '/' + p2;
+    return p1 == '/' ? p1 + p2 : p1 + '/' + p2;
 }
 
 
@@ -2203,7 +2203,7 @@ function load_md_plug(md_text, plug_type, defer) {
             toast.warn(30, '' + ex);
         }
 
-    if (!have_emp)
+    if (nohtml || !have_emp)
         return md_text;
 
     var find = '\n```copyparty_' + plug_type + '\n',
@@ -2244,7 +2244,7 @@ function load_md_plug(md_text, plug_type, defer) {
     return md;
 }
 function md_thumbs(md) {
-    if (!/(^|\n)<!-- th -->/.exec(md))
+    if (nohtml || !/(^|\n)<!-- th -->/.exec(md))
         return md;
 
     // `!th[flags](some.jpg)`
