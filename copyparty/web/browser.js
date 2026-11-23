@@ -396,7 +396,7 @@ if (1)
 		"fs_name": "name",
 		"fs_path": "public path",
 		"fs_public": "show in the public directory",
-		"fs_ppath": "for example, python/aaa.py",
+		"fs_ppath": "for example, /python/aaa.py",
 		"fs_src": "source",
 		"fs_pwd": "passwd",
 		"fs_exp": "expiry",
@@ -407,6 +407,7 @@ if (1)
 		"fs_pname": "optional link name; will be random if blank",
 		"fs_tsrc": "the file or folder to share",
 		"fs_ppwd": "optional password",
+		"fs_public_pw": "optional download password",
 		"fs_w8": "creating share...",
 		"fs_ok": "press <code>Enter/OK</code> to Clipboard\npress <code>ESC/Cancel</code> to Close",
 
@@ -1740,6 +1741,8 @@ function MPlayer() {
 			link = tds[1].getElementsByTagName('a');
 
 		link = link[link.length - 1];
+		if (link.hasAttribute('data-share-lock'))
+			continue;
 		var url = link.getAttribute('href'),
 			fn = url.split('?')[0];
 
@@ -4085,7 +4088,7 @@ var fileman = (function () {
 			can_path ? '<tr><td colspan="2"><label><input type="checkbox" id="sh_path" checked /> ' + L.fs_public + '</label></td></tr>' : '',
 			'<tr><td id="sh_label">' + L.fs_name + '</td><td><input type="text" id="sh_k" ' + NOAC + ' placeholder="  ' + L.fs_pname + '" /></td></tr>',
 			'<tr><td>' + L.fs_src + '</td><td><input type="text" id="sh_vp" ' + NOAC + ' readonly tt="' + L.fs_tsrc + '" /></td></tr>',
-			'<tr id="sh_passwd"><td>' + L.fs_pwd + '</td><td><input type="text" id="sh_pw" ' + NOAC + ' placeholder="  ' + L.fs_ppwd + '" /></td></tr>',
+			'<tr><td>' + L.fs_pwd + '</td><td><input type="password" id="sh_pw" ' + NOAC + ' placeholder="  ' + L.fs_ppwd + '" /></td></tr>',
 			'<tr><td>' + L.fs_exp + '</td><td class="exs">',
 			'<input type="text" id="sh_exm" ' + NOAC + ' /> ' + L.fs_tmin + ' / ',
 			'<input type="text" id="sh_exh" ' + NOAC + ' /> ' + L.fs_thrs + ' / ',
@@ -4179,8 +4182,9 @@ var fileman = (function () {
 				var on = this.checked;
 				ebi('sh_label').textContent = on ? L.fs_path : L.fs_name;
 				sh_k.placeholder = on ? L.fs_ppath : L.fs_pname;
-				sh_k.value = '';
-				sh_rand.style.display = ebi('sh_passwd').style.display = on ? 'none' : '';
+				sh_k.value = on && fns.length == 1 ? '/' + fns[0].split('/').pop() : '';
+				sh_pw.placeholder = on ? L.fs_public_pw : L.fs_ppwd;
+				sh_rand.style.display = on ? 'none' : '';
 				if (wr)
 					ebi('sh_wo').style.display = on ? 'none' : '';
 				if (on)
@@ -4244,7 +4248,7 @@ var fileman = (function () {
 
 			var body = {
 				"vp": fns.length ? fns : [sh_vp.value],
-				"pw": path_mode ? '' : sh_pw.value,
+				"pw": sh_pw.value,
 				"exp": exm.value,
 				"perms": plist,
 			};
@@ -5181,16 +5185,16 @@ var showfile = (function () {
 		var links = msel.getall();
 		for (var a = 0; a < links.length; a++) {
 			var link = links[a],
+				ah = ebi(link.id),
 				fn = link.vp.split('/').pop(),
 				lang = r.getlang(fn);
 
-			if (!lang)
+			if (!lang || ah.hasAttribute('data-share-lock'))
 				continue;
 
 			r.files.push({ 'id': link.id, 'name': link.fn });
 
-			var ah = ebi(link.id),
-				td = ah.closest('tr').getElementsByTagName('td')[0];
+			var td = ah.closest('tr').getElementsByTagName('td')[0];
 
 			if (ah.textContent.endsWith('/'))
 				continue;
@@ -5764,6 +5768,10 @@ var thegrid = (function () {
 				return r.loadsel();
 			clmod(this, 'sel', clgot(tr, 'sel'));
 		}
+		else if (oth.hasAttribute('data-share-lock')) {
+			e.stopImmediatePropagation();
+			return true;
+		}
 		else if (in_tree && !have_sel)
 			in_tree.click();
 
@@ -5925,7 +5933,10 @@ var thegrid = (function () {
 					ext = 'unk';
 			}
 
-			if (use_ext_th && (ext_th[ext] || ext_th[ext0])) {
+			if (ao.hasAttribute('data-share-lock')) {
+				ihref = SR + '/.cpr/ico/' + (isdir ? 'folder' : 'lock');
+			}
+			else if (use_ext_th && (ext_th[ext] || ext_th[ext0])) {
 				ihref = ext_th[ext] || ext_th[ext0];
 			}
 			else if (r.thumbs) {
@@ -7743,7 +7754,7 @@ var treectl = (function () {
 				fname = uricom_dec(bhref),
 				hname = esc(fname),
 				id = 'f-' + ('00000000' + crc32(fname)).slice(-8),
-				lang = showfile.getlang(fname);
+				lang = !tn.locked && showfile.getlang(fname);
 
 			while (seen[id])  // ejyefs ev69gg y9j8sg .opus
 				id += 'a';
@@ -7756,7 +7767,7 @@ var treectl = (function () {
 			}
 
 
-			if (wopi_set && wopi_set.has(tn.ext))
+			if (!tn.locked && wopi_set && wopi_set.has(tn.ext))
 				tn.lead = '<a href="?wopi=' + bhref +
 					'" rel="nofollow" target="_blank" name="' + hname + '">📄</a>';
 
@@ -7766,8 +7777,9 @@ var treectl = (function () {
 					'" hl="' + id + '" name="' + hname + '">-txt-</a>';
 
 			var cl = /\.PARTIAL$/.exec(fname) ? ' class="fade"' : '',
+				lock = tn.locked ? ' data-share-lock' : '',
 				ln = ['<tr' + cl + '><td>' + tn.lead + '</td><td><a href="' +
-					top + tn.href + '" id="' + id + '">' + hname +
+					top + tn.href + '" id="' + id + '"' + lock + '>' + hname +
 					'</a></td><td sortv="' + tn.sz + '">' + filesizefun(tn.sz)];
 
 			for (var b = 0; b < res.taglist.length; b++) {
@@ -7792,7 +7804,7 @@ var treectl = (function () {
 		html = html.join('\n');
 		set_files_html(html);
 		if (r.dlni) {
-			var o = QSA('#files a[id]');
+			var o = QSA('#files a[id]:not([data-share-lock])');
 			for (var a = 0, aa = o.length; a < aa; a++)
 				o[a].setAttribute('download', '');
 		}
@@ -9755,6 +9767,11 @@ function restore_scroll() {
 		scroll_obj.scrollTop = scroll_y;
 }
 
+
+ebi('files').addEventListener('click', function (e) {
+	if (!treectl.csel && e.target.closest('a[data-share-lock]'))
+		e.stopPropagation();
+}, true);
 
 ebi('files').onclick = ebi('docul').onclick = function (e) {
 	if (!treectl.csel && e && (ctrl(e) || e.shiftKey))

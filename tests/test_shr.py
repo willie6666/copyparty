@@ -2,14 +2,16 @@
 # coding: utf-8
 from __future__ import division, print_function, unicode_literals
 
+import io
 import json
 import os
 import shutil
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 
-from copyparty.__init__ import ANYWIN
+from copyparty.__init__ import ANYWIN, E
 from copyparty.authsrv import AuthSrv
 from copyparty.httpcli import HttpCli
 from copyparty.util import absreal
@@ -287,13 +289,13 @@ class TestShr(unittest.TestCase):
 
         for path in (
             "python", "python/aaa.py", "python/aaa.py/x", "secret/x",
-            "a/../b", "a//b", "/a", "a/", "",
+            "a/../b", "a//b", "//a", "a/", "",
         ):
             h, body = self.post_json(auth, dict(file_req, path=path))
             self.assertTrue(h.startswith("HTTP/1.1 400 "), body)
         h, body = self.post_json(auth, dict(file_req, k="python"))
         self.assertTrue(h.startswith("HTTP/1.1 400 "), body)
-        h, body = self.post_json(auth, dict(file_req, path="private", pw="p3"))
+        h, body = self.post_json(auth, dict(file_req, path="private", pw="p3", perms=[]))
         self.assertTrue(h.startswith("HTTP/1.1 400 "), body)
         h, body = self.post_json("?share", dict(file_req, path="unauthorized"))
         self.assertTrue(h.startswith("HTTP/1.1 400 "), body)
@@ -339,6 +341,104 @@ class TestShr(unittest.TestCase):
         self.asrv.reload()
         self.assertFalse(self.ls("shr/libraries/pair", False)[0])
         self.assertTrue(self.curl("shr/secret/f1?pw=p2")[0].startswith("HTTP/1.1 200 "))
+
+    def test_password_protected_public_paths(self):
+        self.args = Cfg(
+            a=["u1:p1"],
+            v=["d1:private:A,u1", "d2:folder:A,u1"],
+            shr="/shr/",
+            shr1="shr/",
+            shr_db="a.db",
+            shr_path=True,
+            shr_v=False,
+        )
+        self.cinit()
+        self.addCleanup(self.conn.shutdown)
+        for name in ("browser2", "msg", "splash"):
+            with open(os.path.join(E.mod_, "web", name + ".html"), "rb") as f:
+                self.conn.hsrv.j2[name] = tu.J2_ENV.from_string(f.read().decode("utf-8"))
+        with open("d1/public", "wb") as f:
+            f.write(b"public file")
+        for path, src, password in (
+            ("/檔案.txt", "/private/f1", "file-pass"),
+            ("/folder", "/folder/", "dir-pass"),
+            ("/open.txt", "/private/public", ""),
+        ):
+            jt = {"path": path, "vp": [src], "pw": password, "perms": ["read"], "exp": "0"}
+            h, body = self.post_json("?pw=p1&share", jt)
+            self.assertTrue(h.startswith("HTTP/1.1 201 "), body)
+            self.assertIn("/shr/", body)
+            self.assertNotIn("/shr//", body)
+        self.asrv.reload()
+
+        filename = "%E6%AA%94%E6%A1%88.txt"
+        listed = json.loads(self.curl("shr/?ls")[1])
+        self.assertTrue(any(x["href"] == "folder/" and x["locked"] for x in listed["dirs"]))
+        locked = next(x for x in listed["files"] if x["href"] == filename + "?dl")
+        self.assertTrue(locked["locked"])
+        _, page = self.curl("shr/?b")
+        self.assertIn(filename + "?dl", page)
+        self.assertIn("folder/", page)
+        _, page = self.curl("shr/folder/")
+        self.assertIn("f2?dl", page)
+        self.assertIn("Unlock this share", page)
+        self.assertIn("f2?dl", self.ls("shr/folder/", False)[2])
+
+        for url in (
+            "shr/" + filename + "?dl",
+            "shr/" + filename + "?pw=wrong",
+            "shr/?doc=" + filename,
+            "shr/folder/f2?dl",
+            "shr/folder/?doc=f2",
+            "shr/folder/?zip",
+        ):
+            h, body = self.curl(url, True)
+            self.assertTrue(h.startswith(("HTTP/1.1 401 ", "HTTP/1.1 403 ")), h)
+            self.assertNotIn(b">>fb:", body)
+        self.assertIn('name="cppwd"', self.curl("shr/" + filename + "?dl")[1])
+        h, body = self.curl("shr/" + filename + "?th=j", True)
+        self.assertIn("Content-Type: image/svg+xml", h)
+        self.assertNotIn(b">>fb:", body)
+
+        h, data = self.curl("shr/?zip", True)
+        self.assertTrue(h.startswith("HTTP/1.1 200 "), h)
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            self.assertEqual(archive.namelist(), ["shr/open.txt"])
+            self.assertEqual(archive.read("shr/open.txt"), b"public file")
+        h, body = self.curl("shr/folder/f2?dl&pw=dir-pass", True)
+        self.assertTrue(h.startswith("HTTP/1.1 200 "), h)
+        self.assertEqual(body, b">>fb:d2/f2")
+
+        for pw in (b"p1", b"file-pass"):
+            data = (
+                b'--copyparty\r\nContent-Disposition: form-data; name="act"\r\n\r\nlogin\r\n'
+                b'--copyparty\r\nContent-Disposition: form-data; name="cppwd"\r\n\r\n'
+                + pw + b"\r\n--copyparty--\r\n"
+            )
+            req = (
+                "POST /shr/%s?dl HTTP/1.1\r\nConnection: close\r\n"
+                "Content-Type: multipart/form-data; boundary=copyparty\r\n"
+                "Content-Length: %d\r\n\r\n" % (filename, len(data))
+            ).encode("ascii") + data
+            HttpCli(self.conn.setbuf(req)).run()
+            headers, body = self.conn.s._reply.split(b"\r\n\r\n", 1)
+            if pw == b"p1":
+                self.assertIn(b"Incorrect share password", body)
+                self.assertNotIn(b"Set-Cookie:", headers)
+
+        self.assertIn(b"Share unlocked", body)
+        cookie = next(x for x in headers.splitlines() if x.startswith(b"Set-Cookie: "))
+        cookie = cookie.split(b": ", 1)[1].split(b";", 1)[0]
+        req = (
+            ("GET /shr/%s?dl&cache=i HTTP/1.1\r\nConnection: close\r\nCookie: " % filename)
+            .encode("ascii") + cookie + b"\r\n\r\n"
+        )
+        HttpCli(self.conn.setbuf(req)).run()
+        headers, body = self.conn.s._reply.split(b"\r\n\r\n", 1)
+        self.assertTrue(headers.startswith(b"HTTP/1.1 200 "), headers)
+        self.assertIn(b"Cache-Control: private, no-store", headers)
+        self.assertIn(b"Content-Disposition: attachment;", headers)
+        self.assertEqual(body, b">>fb:d1/f1")
 
     def test_public_share_copy_preserves_destination(self):
         self.args = Cfg(

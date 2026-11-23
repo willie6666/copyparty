@@ -1054,9 +1054,9 @@ Enable `--shr-path` to create public shares at paths such as `python/aaa.py`. Fo
   shr-path
 ```
 
-Select a file, click **share**, and enter `python/aaa.py` in **public path**. Visitors can browse `/s/` without signing in and download the file at `/s/python/aaa.py`. Sharing a folder or selecting multiple files creates a directory at the specified path.
+Select a file and click **share**. **Public path** starts with the selected filename, such as `/aaa.py`, and you can change it to `/python/aaa.py`. Visitors can browse `/s/` without signing in and open the file at `/s/python/aaa.py`. Sharing a folder or selecting multiple files creates a directory at the specified path.
 
-Public paths require read permission and have no password. Uncheck **show in the public directory** to create a regular named share, which stays out of the public listing. Both types use the same namespace, so a share can't occupy another share's path or one of its parent directories. Use `shr-who: a` if only volume admins should be able to create shares.
+Public paths require read permission. Set an optional download password to keep file names visible while requiring visitors to unlock downloads and previews. Uncheck **show in the public directory** to create a regular named share, which stays out of the public listing. Both types use the same namespace, so a share can't occupy another share's path or one of its parent directories. Use `shr-who: a` if only volume admins should be able to create shares.
 
 users can delete their own shares in the controlpanel, and a list of privileged users (`--shr-adm`) are allowed to see and/or delet any share on the server
 

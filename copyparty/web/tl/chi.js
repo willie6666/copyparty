@@ -390,7 +390,7 @@ Ls.chi = {
 	"fs_name": "名称",
 	"fs_path": "公开路径",
 	"fs_public": "在公开目录中显示",
-	"fs_ppath": "例如 python/aaa.py",
+	"fs_ppath": "例如 /python/aaa.py",
 	"fs_src": "源",
 	"fs_pwd": "密码",
 	"fs_exp": "过期",
@@ -401,6 +401,7 @@ Ls.chi = {
 	"fs_pname": "链接名称可留空，留空则随机生成",
 	"fs_tsrc": "要分享的文件或文件夹",
 	"fs_ppwd": "密码可留空",
+	"fs_public_pw": "下载密码，可留空",
 	"fs_w8": "正在创建分享链接...",
 	"fs_ok": "按 <code>Enter/确定</code> 复制到剪贴板\n按 <code>ESC/取消</code> 关闭",
 

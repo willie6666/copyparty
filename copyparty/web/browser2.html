@@ -17,6 +17,9 @@
 	{%- if srv_info %}
 	<p><span>{{ srv_info }}</span></p>
 	{%- endif %}
+	{%- if share_unlock %}
+	<p><a href="{{ share_unlock }}">Unlock this share to download files</a></p>
+	{%- endif %}
 
 	{%- if have_b_u %}
 	<form method="post" enctype="multipart/form-data" accept-charset="utf-8" action="{{ url_suf }}">
@@ -45,7 +48,7 @@
 			</tr>
 		</thead>
 		<tbody>
-<tr><td></td><td><a href="../{{ url_suf }}">parent folder</a></td><td>-</td><td>-</td></tr>
+<tr><td></td><td><a href="{{ parent_href or '../' }}{{ url_suf }}">parent folder</a></td><td>-</td><td>-</td></tr>
 
 {%- for f in files %}
 <tr><td>{{ f.lead }}</td><td><a href="{{ f.href }}{{

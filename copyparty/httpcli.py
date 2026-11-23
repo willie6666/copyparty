@@ -899,6 +899,9 @@ class HttpCli(object):
 
         try:
             assert avn  # type: ignore  # !rm
+            perms: Sequence[bool] = avn.uaxs[self.uname]
+            if vn.shr_locked and avn is not vn:
+                perms = tuple(a and b for a, b in zip(perms, vn.uaxs[self.uname]))
             (
                 self.can_read,
                 self.can_write,
@@ -909,7 +912,7 @@ class HttpCli(object):
                 self.can_html,
                 self.can_admin,
                 self.can_dot,
-            ) = avn.uaxs[self.uname]
+            ) = perms
         except:
             pass  # default is all-false
 
@@ -1147,6 +1150,9 @@ class HttpCli(object):
         # headers{} overrides anything set previously
         if headers:
             self.out_headers.update(headers)
+
+        if self.vn.shr_locked:
+            self.out_headers["Cache-Control"] = "private, no-store"
 
         if status == 304:
             self.out_headers.pop("Content-Length", None)
@@ -1486,6 +1492,9 @@ class HttpCli(object):
         if "cf_challenge" in self.uparam:
             self.reply(self.j2s("cf").encode("utf-8", "replace"))
             return True
+
+        if self.vn.shr_locked and not self.can_read:
+            return self.tx_locked_share()
 
         if not self.can_read and not self.can_write and not self.can_get:
             t = "@%s has no access to %r"
@@ -3206,7 +3215,10 @@ class HttpCli(object):
             body = json.loads(json_buf.decode(enc, "replace"))
             try:
                 zds = {k: v for k, v in body.items()}
-                zds["hash"] = "%d chunks" % (len(body["hash"]),)
+                if "share" in self.uparam and "pw" in zds:
+                    zds["pw"] = "[redacted]"
+                if isinstance(zds.get("hash"), (dict, list, str, unicode)):
+                    zds["hash"] = "%d chunks" % (len(body["hash"]),)
             except:
                 zds = body
             t = "POST len=%d type=%s ip=%s user=%s req=%r json=%s"
@@ -3689,7 +3701,10 @@ class HttpCli(object):
             dst += "&" if "?" in dst else "?"
             dst += "_=1#" + html_escape(uhash, True, True)
 
-        _, msg = self.get_pwd_cookie(pwd)
+        share = self.vn if self.vn.shr_locked else None
+        ok, msg = self.get_pwd_cookie(pwd, share)
+        if share and ok:
+            msg = "Share unlocked"
         h2 = '<a href="' + dst + '">continue</a>'
         html = self.j2s("msg", h1=msg, h2=h2, redir=dst)
         self.reply(html.encode("utf-8"))
@@ -3710,13 +3725,15 @@ class HttpCli(object):
         self.reply(html.encode("utf-8"))
         return True
 
-    def get_pwd_cookie(self, pwd: str) -> tuple[bool, str]:
+    def get_pwd_cookie(self, pwd: str, share: Optional[VFS] = None) -> tuple[bool, str]:
         uname = self.asrv.sesa.get(pwd)
         if not uname:
             hpwd = self.asrv.ah.hash(pwd)
             uname = self.asrv.iacct.get(hpwd)
             if uname:
                 pwd = self.asrv.ases.get(uname) or pwd
+        if share and uname not in share.axs.uread:
+            uname = ""
         if uname and self.conn.hsrv.ipr:
             znm = self.conn.hsrv.ipr.get(uname)
             if znm and not znm.map(self.ip):
@@ -3737,6 +3754,8 @@ class HttpCli(object):
                 self.log("invalid password: %r" % (logpwd,), 3)
                 self.cbonk(self.conn.hsrv.gpwd, pwd, "pw", "invalid passwords")
 
+            if share:
+                return False, "Incorrect share password"
             msg = "naw dude"
             pwd = "x"  # nosec
             dur = 0
@@ -6767,16 +6786,20 @@ class HttpCli(object):
             raise Pebkac(500, "server busy, cannot create share; please retry in a bit")
 
         if self.args.shr_v:
-            self.log("handle_share: " + json.dumps(req, indent=4))
+            safe_req = {k: v for k, v in req.items() if k != "pw"}
+            self.log("handle_share: " + json.dumps(safe_req, indent=4))
 
         is_path = "path" in req
         if is_path:
             if not self.args.shr_path:
                 raise Pebkac(400, "public share paths require --shr-path")
             path = req["path"]
+            if not isinstance(path, (str, unicode)):
+                raise Pebkac(400, "enter a valid public share path")
+            if path.startswith("/"):
+                path = path[1:]
             if (
-                not isinstance(path, (str, unicode))
-                or len(path) > 1024
+                len(path) > 1024
                 or relchk(path)
                 or RE_CC.search(path)
                 or "\\" in path
@@ -6787,7 +6810,7 @@ class HttpCli(object):
                 or undot(path) != path
                 or (VPTL_OS and path.translate(VPTL_OS) != path)
             ):
-                raise Pebkac(400, "enter a valid relative share path")
+                raise Pebkac(400, "enter a valid public share path")
             skey = "/" + path
         else:
             skey = req["k"]
@@ -6834,9 +6857,8 @@ class HttpCli(object):
         s_get = "get" in req["perms"]
         s_dot = "dot" in req["perms"]
         if is_path:
-            if not s_rd or req.get("pw"):
-                t = "public share paths require read access and an empty password"
-                raise Pebkac(400, t)
+            if not s_rd:
+                raise Pebkac(400, "public share paths require read access")
             if fns and s_wr:
                 raise Pebkac(400, "write access requires sharing a folder")
         # will_read, will_write, will_move, will_del, will_get
@@ -6878,8 +6900,17 @@ class HttpCli(object):
             if not bos.path.isfile(src) or vfs.chk_ap(src) != vfs:
                 raise Pebkac(400, "selected file is not accessible: %r" % (fns[0],))
 
-        pw = req.get("pw") or ""
-        pw = self.asrv.ah.hash(pw)
+        pw = req.get("pw")
+        if pw is None:
+            pw = ""
+        if is_path and (
+            not isinstance(pw, (str, unicode))
+            or pw == "x"
+            or RE_CC.search(pw)
+            or len(pw.encode("utf-8", "replace")) > 64
+        ):
+            raise Pebkac(400, "enter a valid share password of up to 64 UTF-8 bytes")
+        pw = self.asrv.ah.hash(pw or "")
         now = int(time.time())
         sexp = req["exp"]
         exp = int(sexp) if sexp else 0
@@ -7166,6 +7197,80 @@ class HttpCli(object):
 
         ret += "\n\033[0m" if arg == "v" else "\n"
         self.reply(ret.encode("utf-8", "replace"), mime=mime)
+        return True
+
+    def tx_locked_share(self) -> bool:
+        vn = self.vn
+        rem = self.rem
+        if (
+            vn.shr_file
+            or self.avn is not vn
+            or (vn.shr_files and rem)
+            or "/." in ("/" + rem)
+            or any(
+                k in self.uparam
+                for k in ("unlock", "dl", "zip", "tar", "doc", "th", "v", "opds")
+            )
+        ):
+            return self.tx_404(True)
+        ap = vn.canonical(rem)
+        if not bos.path.isdir(ap) or vn.chk_ap(ap) is not vn:
+            return self.tx_404(True)
+
+        fsroot, entries, _ = vn.ls(
+            rem, self.uname, not self.args.no_scandir, [[True, False]]
+        )
+        if "dothidden" in vn.flags and any(x[0] == ".hidden" for x in entries):
+            entries = exclude_dothidden_ls(entries, fsroot)
+        else:
+            entries = exclude_dotfiles_ls(entries)
+
+        dirs = []
+        files = []
+        is_ls = "ls" in self.uparam
+        base = "" if is_ls else self.args.SRS + quotep(self.vpath) + "/"
+        for name, st in entries:
+            is_dir = stat.S_ISDIR(st.st_mode)
+            href = base + quotep(name) + ("/" if is_dir else "?dl")
+            date = datetime.fromtimestamp(max(0, min(2 << 36, st.st_mtime)), UTC)
+            item = {
+                "lead": "🔒",
+                "href": href,
+                "name": name + ("/" if is_dir and not is_ls else ""),
+                "sz": st.st_size,
+                "dt": date.strftime("%Y-%m-%d %H:%M:%S"),
+                "ts": int(st.st_mtime),
+                "ext": "---" if is_dir else "%",
+                "locked": True,
+            }
+            (dirs if is_dir else files).append(item)
+
+        logues = ["", ""]
+        if is_ls:
+            return self.tx_ls(
+                {
+                    "dirs": dirs,
+                    "files": files,
+                    "taglist": [],
+                    "logues": logues,
+                    "readmes": logues,
+                    "srvinf": "",
+                    "acct": self.uname,
+                    "perms": [],
+                    "cfg": vn.js_ls,
+                }
+            )
+
+        html = self.j2s(
+            "browser2",
+            title=html_escape(self.vpath, crlf=True),
+            files=dirs + files,
+            logues=logues,
+            url_suf="",
+            share_unlock=base + "?unlock",
+            parent_href=self.args.SRS + quotep(vsplit(self.vpath)[0]).rstrip("/") + "/",
+        )
+        self.reply(html.encode("utf-8", "replace"))
         return True
 
     def tx_browser(self) -> bool:
@@ -7566,6 +7671,11 @@ class HttpCli(object):
             lstat="lt" in self.uparam,
             throw=True,
         )
+        if vn.shr_dir and not is_opds:
+            # The browser can list a locked share without granting read access.
+            vfs_virt.update(
+                (name, child) for name, child in vn.nodes.items() if child.shr_locked
+            )
         stats = {k: v for k, v in vfs_ls}
         ls_names = [x[0] for x in vfs_ls]
         ls_names.extend(list(vfs_virt))
@@ -7633,6 +7743,7 @@ class HttpCli(object):
             href = base + fn
 
             dvn = vfs_virt.get(fn)
+            locked = bool(dvn and dvn.shr_locked and self.uname not in dvn.axs.uread)
             if dvn:
                 fspath = dvn.canonical("") if dvn.shr_file else dvn.realpath
             else:
@@ -7651,7 +7762,9 @@ class HttpCli(object):
             is_dir = stat.S_ISDIR(inf.st_mode)
             if is_dir:
                 href += "/"
-                if no_zip:
+                if locked:
+                    margin = "🔒"
+                elif no_zip:
                     margin = "DIR"
                 elif add_dk:
                     zs = absreal(fspath)
@@ -7663,6 +7776,8 @@ class HttpCli(object):
                     margin = '<a href="%s?zip=crc" rel="nofollow">zip</a>' % (
                         quotep(href),
                     )
+            elif locked:
+                margin = "🔒"
             elif fn in hist:
                 margin = '<a href="%s.hist/%s" rel="nofollow">#%s</a>' % (
                     base,
@@ -7710,6 +7825,8 @@ class HttpCli(object):
                 )
             else:
                 href = quotep(href)
+            if locked and not is_dir:
+                href += "?dl"
 
             item = {
                 "lead": margin,
@@ -7720,6 +7837,8 @@ class HttpCli(object):
                 "dt": dt,
                 "ts": int(linf.st_mtime),
             }
+            if locked:
+                item["locked"] = True
             if is_dir:
                 dirs.append(item)
             else:
@@ -7899,6 +8018,8 @@ class HttpCli(object):
                 # found Foo but want FOO
                 dfn = next((x for x in files if x["name"] == doc), None)
             docnode = vfs_virt.get(doc) if vn.shr_dir else None
+            if docnode and docnode.shr_locked and self.uname not in docnode.axs.uread:
+                raise Pebkac(403, "Enter the share password to download this file")
             if dfn and (not vn.shr_dir or (docnode and docnode.shr_file)):
                 docpath = docnode.canonical("") if docnode else os.path.join(abspath, doc)
                 try:

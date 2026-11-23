@@ -440,6 +440,7 @@ class VFS(object):
         self.shr_key = ""  # database key; public paths start with a slash
         self.shr_dir = False  # virtual directory in the public share tree
         self.shr_file = False  # share mounted at the file itself
+        self.shr_locked = False  # public listing with password-protected contents
         self.shr_all_aps: list[tuple[str, list[VFS]]] = []
         self.aread: dict[str, list[str]] = {}
         self.awrite: dict[str, list[str]] = {}
@@ -2152,6 +2153,7 @@ class AuthSrv(object):
                 vp = vjoin(shr, s_k.lstrip("/"))
                 vol = VFS(self.log_func, "", vp, vp, s_axs, shv.flags.copy())
                 vol.shr_key = s_k
+                vol.shr_locked = is_path and bool(s_pw)
                 vol.get_dbv = vol._get_share_src
                 vol.ls = vol._ls_nope
                 vfs.all_vols[vp] = vfs.all_nodes[vp] = vol
