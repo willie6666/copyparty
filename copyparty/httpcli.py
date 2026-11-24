@@ -6756,22 +6756,24 @@ class HttpCli(object):
             t = "your username (%r) does not match the sharekey's owner (%r) and you're not admin"
             raise Pebkac(400, t % (self.uname, un))
 
-        reload = False
+        relod = False
         act = self.uparam["eshare"]
         if act == "rm":
             cur.execute("delete from sh where k = ?", (skey,))
             cur.execute("delete from sf where k = ?", (skey,))
-            reload = True
+            vp = vjoin(self.args.shr1.rstrip("/"), skey.lstrip("/"))
+            node = self.asrv.vfs.all_nodes.get(vp)
+            relod = bool(node and node.shr_key == skey)
         else:
             now = time.time()
             if expiry < now:
                 expiry = now
-                reload = True
+                relod = True
             expiry += int(act) * 60
             cur.execute("update sh set t1 = ? where k = ?", (expiry, skey))
 
         cur.connection.commit()
-        if reload:
+        if relod:
             self.conn.hsrv.broker.ask("reload", False, True).get()
             self.conn.hsrv.broker.ask("up2k.wake_rescanner").get()
 
@@ -6937,10 +6939,21 @@ class HttpCli(object):
 
             q = "insert into sh values (?,?,?,?,?,?,?,?)"
             cur.execute(q, (skey, pw, vp, pr, len(fns), self.uname, now, exp))
+            rowid = cur.lastrowid
             if fns:
                 cur.executemany("insert into sf values (?,?)", [(skey, fn) for fn in fns])
 
-        self.conn.hsrv.broker.ask("reload", False, True).get()
+        try:
+            self.conn.hsrv.broker.ask("reload", False, True).get()
+        except Exception:
+            with cur.connection:
+                q = "delete from sh where rowid = ? and k = ? and pw = ? and t0 = ?"
+                cur.execute(q, (rowid, skey, pw, now))
+                if cur.rowcount:
+                    cur.execute("delete from sf where k = ?", (skey,))
+            self.conn.hsrv.broker.ask("reload", False, True).get()
+            raise Pebkac(400, "bad password")
+
         self.conn.hsrv.broker.ask("up2k.wake_rescanner").get()
 
         if is_path and len(fns) == 1:
@@ -7714,7 +7727,15 @@ class HttpCli(object):
             else:
                 ls_names = exclude_dotfiles(ls_names)
 
-        add_dk = not use_filekey and vf.get("dk")
+        add_dk = (
+            "dk" in vf
+            and not use_filekey
+            and (
+                (self.can_read and self.uname in vn.axs.uread)
+                or ("dks" in vf and use_dirkey)
+            )
+            and vf.get("dk")
+        )
         add_fk = vf.get("fk")
         fk_alg = 2 if "fka" in vf else 1
         if add_dk:
